@@ -19,13 +19,13 @@ from devito.mpi import MPI
 from devito.parameters import configuration
 from devito.symbolics import FieldFromPointer
 from devito.finite_differences import Differentiable, generate_fd_shortcuts
-from devito.tools import (EnrichedTuple, ReducerMap, as_tuple, flatten, is_integer,
+from devito.tools import (ReducerMap, as_tuple, flatten, is_integer,
                           ctypes_to_cstr, memoized_meth, dtype_to_ctype)
 from devito.types.dimension import Dimension
 from devito.types.args import ArgProvider
 from devito.types.caching import CacheManager
 from devito.types.basic import AbstractFunction, Size
-from devito.types.utils import Buffer, NODE, CELL
+from devito.types.utils import Buffer, DimensionTuple, NODE, CELL
 
 __all__ = ['Function', 'TimeFunction']
 
@@ -33,7 +33,7 @@ __all__ = ['Function', 'TimeFunction']
 RegionMeta = namedtuple('RegionMeta', 'offset size')
 
 
-class DiscreteFunction(AbstractFunction, ArgProvider):
+class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
 
     """
     Tensor symbol representing a discrete function in symbolic equations.
@@ -98,14 +98,11 @@ class DiscreteFunction(AbstractFunction, ArgProvider):
                              % type(initializer))
 
     def __eq__(self, other):
-        """Quick self == other comparison."""
-        if self.__class__ is not other.__class__:
-            return False
-        # Still need to check for different arguments eg `f(x)` and `f(x+3)`
-        # Note that hash(f(x)) == hash(f(x+3)), but clearly f(x) != f(x+3)
-        # However, checking the args by equality may be expensive due to
-        # sympify(), so here we rather check for idendity
-        return all(i is j for i, j in zip(self.args, other.args))
+        # The only possibility for two DiscreteFunctions to be considered equal
+        # is that they are indeed the same exact object
+        return self is other
+
+    _subs = Differentiable._subs
 
     __hash__ = AbstractFunction.__hash__  # Required since we're overriding __eq__
 
@@ -308,17 +305,39 @@ class DiscreteFunction(AbstractFunction, ArgProvider):
     @cached_property
     def _size_outhalo(self):
         """Number of points in the outer halo region."""
+
         if self._distributor is None:
+            # Computational domain is not distributed and hence the outhalo
+            # and inhalo correspond
             return self._size_inhalo
 
-        left = [self._distributor.glb_to_loc(d, i, LEFT, strict=False)
-                for d, i in zip(self.dimensions, self._size_inhalo.left)]
-        right = [self._distributor.glb_to_loc(d, i, RIGHT, strict=False)
-                 for d, i in zip(self.dimensions, self._size_inhalo.right)]
+        left = [abs(min(i.loc_abs_min-i.glb_min-j, 0)) if i and not i.loc_empty else 0
+                for i, j in zip(self._decomposition, self._size_inhalo.left)]
+        right = [max(i.loc_abs_max+j-i.glb_max, 0) if i and not i.loc_empty else 0
+                 for i, j in zip(self._decomposition, self._size_inhalo.right)]
 
         sizes = tuple(Size(i, j) for i, j in zip(left, right))
 
-        return EnrichedTuple(*sizes, getters=self.dimensions, left=left, right=right)
+        if self._distributor.is_parallel and (any(left) > 0 or any(right)) > 0:
+            try:
+                warning_msg = """A space order of {0} and a halo size of {1} has been
+                                 set but the current rank ({2}) has a domain size of
+                                 only {3}""".format(self._space_order,
+                                                    max(self._size_inhalo),
+                                                    self._distributor.myrank,
+                                                    min(self.grid.shape_local))
+                if not self._distributor.is_boundary_rank:
+                    warning(warning_msg)
+                else:
+                    for i, j, k, l in zip(left, right, self._distributor.mycoords,
+                                          self._distributor.topology):
+                        if l > 1 and ((j > 0 and k == 0) or (i > 0 and k == l-1)):
+                            warning(warning_msg)
+                            break
+            except AttributeError:
+                pass
+
+        return DimensionTuple(*sizes, getters=self.dimensions, left=left, right=right)
 
     @property
     def size_allocated(self):
@@ -632,6 +651,11 @@ class DiscreteFunction(AbstractFunction, ArgProvider):
         dataobj._obj.hsize = (c_int*(self.ndim*2))(*flatten(self._size_halo))
         dataobj._obj.hofs = (c_int*(self.ndim*2))(*flatten(self._offset_halo))
         dataobj._obj.oofs = (c_int*(self.ndim*2))(*flatten(self._offset_owned))
+
+        # stash a reference to the array on _obj, so we don't let it get freed
+        # while we hold onto _obj
+        dataobj._obj.underlying_array = data
+
         return dataobj
 
     def _C_as_ndarray(self, dataobj):
@@ -819,7 +843,7 @@ class DiscreteFunction(AbstractFunction, ArgProvider):
         ['grid', 'staggered', 'initializer']
 
 
-class Function(DiscreteFunction, Differentiable):
+class Function(DiscreteFunction):
 
     """
     Tensor symbol representing a discrete function in symbolic equations.
@@ -943,6 +967,10 @@ class Function(DiscreteFunction, Differentiable):
         # parameter has to be computed at x + hx/2)
         self._is_parameter = kwargs.get('parameter', False)
 
+    @cached_property
+    def _fd_priority(self):
+        return 1 if self.staggered in [NODE, None] else 2
+
     @property
     def is_parameter(self):
         return self._is_parameter
@@ -950,9 +978,12 @@ class Function(DiscreteFunction, Differentiable):
     def _eval_at(self, func):
         if not self.is_parameter or self.staggered == func.staggered:
             return self
-
-        return self.subs({self.indices_ref[d1]: func.indices_ref[d1]
-                          for d1 in self.dimensions})
+        mapper = {self.indices_ref[d]: func.indices_ref[d]
+                  for d in self.dimensions
+                  if self.indices_ref[d] is not func.indices_ref[d]}
+        if mapper:
+            return self.subs(mapper)
+        return self
 
     @classmethod
     def __indices_setup__(cls, **kwargs):
@@ -973,9 +1004,9 @@ class Function(DiscreteFunction, Differentiable):
             for s in as_tuple(staggered):
                 c, s = s.as_coeff_Mul()
                 mapper.update({s: s + c * s.spacing/2})
+            staggered_indices = mapper.values()
 
-            staggered_indices = tuple(mapper.values())
-        return tuple(dimensions), staggered_indices
+        return tuple(dimensions), tuple(staggered_indices)
 
     @property
     def is_Staggered(self):
@@ -1093,7 +1124,7 @@ class Function(DiscreteFunction, Differentiable):
                 rp = p // 2
             indices = [d - i for i in range(lp, 0, -1)]
             indices.extend([d + i for i in range(rp)])
-            points.extend([self.subs(d, i) for i in indices])
+            points.extend([self.subs({d: i}) for i in indices])
         return sum(points)
 
     def avg(self, p=None, dims=None):
@@ -1292,6 +1323,10 @@ class TimeFunction(Function):
                 raise TypeError("`save` can be None, int or Buffer, not %s" % type(save))
         return tuple(shape)
 
+    @cached_property
+    def _fd_priority(self):
+        return super(TimeFunction, self)._fd_priority + .1
+
     @property
     def time_order(self):
         """The time order."""
@@ -1303,7 +1338,7 @@ class TimeFunction(Function):
         i = int(self.time_order / 2) if self.time_order >= 2 else 1
         _t = self.dimensions[self._time_position]
 
-        return self.subs(_t, _t + i * _t.spacing)
+        return self._subs(_t, _t + i * _t.spacing)
 
     @property
     def backward(self):
@@ -1311,7 +1346,7 @@ class TimeFunction(Function):
         i = int(self.time_order / 2) if self.time_order >= 2 else 1
         _t = self.dimensions[self._time_position]
 
-        return self.subs(_t, _t - i * _t.spacing)
+        return self._subs(_t, _t - i * _t.spacing)
 
     @property
     def _time_size(self):

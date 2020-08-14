@@ -1,19 +1,18 @@
 import numpy as np
 import pytest
-from unittest.mock import patch
 from cached_property import cached_property
 
 from conftest import skipif
 from devito import (Grid, Constant, Function, TimeFunction, SparseFunction,
                     SparseTimeFunction, Dimension, ConditionalDimension, SubDimension,
-                    Eq, Inc, NODE, Operator, norm, inner, configuration, switchconfig,
-                    generic_derivative)
+                    SubDomain, Eq, Ne, Inc, NODE, Operator, norm, inner, configuration,
+                    switchconfig, generic_derivative)
 from devito.data import LEFT, RIGHT
 from devito.ir.iet import Call, Conditional, Iteration, FindNodes, retrieve_iteration_tree
 from devito.mpi import MPI
 from examples.seismic.acoustic import acoustic_setup
 
-pytestmark = skipif(['yask', 'ops', 'nompi'], whole_module=True)
+pytestmark = skipif(['nompi'], whole_module=True)
 
 
 class TestDistributor(object):
@@ -320,20 +319,22 @@ class TestFunction(object):
 class TestSparseFunction(object):
 
     @pytest.mark.parallel(mode=4)
-    @pytest.mark.parametrize('coords', [
-        ((1., 1.), (1., 3.), (3., 1.), (3., 3.)),
+    @pytest.mark.parametrize('shape, coords, points', [
+        ((4, 4), ((1., 1.), (1., 3.), (3., 1.), (3., 3.)), 1),
+        ((8, ), ((1.,), (3.,), (5.,), (7.,)), 1),
+        ((8, ), ((1.,), (2.,), (3.,), (4.,), (5.,), (6.,), (7.,), (8.,)), 2)
     ])
-    def test_ownership(self, coords):
+    def test_ownership(self, shape, coords, points):
         """Given a sparse point ``p`` with known coordinates, this test checks
         that the MPI rank owning ``p`` is retrieved correctly."""
-        grid = Grid(shape=(4, 4), extent=(4.0, 4.0))
+        grid = Grid(shape=shape, extent=shape)
 
-        sf = SparseFunction(name='sf', grid=grid, npoint=4, coordinates=coords)
+        sf = SparseFunction(name='sf', grid=grid, npoint=len(coords), coordinates=coords)
 
         # The domain decomposition is so that the i-th MPI rank gets exactly one
         # sparse point `p` and, incidentally, `p` is logically owned by `i`
-        assert len(sf.gridpoints) == 1
-        assert all(grid.distributor.glb_to_rank(i) == grid.distributor.myrank
+        assert len(sf.gridpoints) == points
+        assert all(grid.distributor.glb_to_rank(i)[0] == grid.distributor.myrank
                    for i in sf.gridpoints)
 
     @pytest.mark.parallel(mode=4)
@@ -737,6 +738,25 @@ class TestCodeGeneration(object):
         assert len(calls) == 0
 
     @pytest.mark.parallel(mode=1)
+    def test_do_haloupdate_with_constant_locindex(self):
+        """
+        Like `test_avoid_haloupdate_with_constant_index`, there is again
+        a constant index, but this time along a loc-index (`t` Dimension),
+        which needs to be handled by the `compute_loc_indices` function.
+        The actual halo update is induced by u.dx.
+        """
+        grid = Grid(shape=(4,))
+        x = grid.dimensions[0]
+
+        u = TimeFunction(name='u', grid=grid)
+
+        eq = Eq(u.forward, u[0, x] + u.dx)
+        op = Operator(eq)
+
+        calls = FindNodes(Call).visit(op)
+        assert len(calls) == 1
+
+    @pytest.mark.parallel(mode=1)
     def test_hoist_haloupdate_if_no_flowdep(self):
         grid = Grid(shape=(12,))
         x = grid.dimensions[0]
@@ -785,14 +805,66 @@ class TestCodeGeneration(object):
         # There are exactly two halo exchange calls in the Operator body
         calls = FindNodes(Call).visit(op)
         assert len(calls) == 2 + 8  # 8 are due to loop blocking
-        assert calls[0].name == 'haloupdate0'
-        assert calls[1].name == 'haloupdate0'
+        assert calls[0].name == 'haloupdate_0'
+        assert calls[1].name == 'haloupdate_0'
 
         # ... and none in the created efuncs
         calls = FindNodes(Call).visit(op._func_table['bf0'].root)
         assert len(calls) == 0
         calls = FindNodes(Call).visit(op._func_table['bf1'].root)
         assert len(calls) == 0
+
+    @pytest.mark.parallel(mode=1)
+    def test_hoist_haloupdate_from_innerloop(self):
+        grid = Grid(shape=(4, 4, 4))
+        x, y, z = grid.dimensions
+
+        f = Function(name='f', grid=grid, space_order=4)
+        g = Function(name='g', grid=grid, space_order=2)
+
+        eqns = [Eq(g, f.dzl + f.dzr + 1),
+                Eq(f, g)]
+
+        op = Operator(eqns, opt=('advanced', {'openmp': False}))
+
+        calls = FindNodes(Call).visit(op)
+        assert len(calls) == 1
+
+        # Also make sure the Call is at the right place in the IET
+        assert op.body[-1].body[0].body[0].body[0].body[0].is_Call
+        assert op.body[-1].body[0].body[0].body[0].body[1].is_Iteration
+
+    @pytest.mark.parallel(mode=2)
+    def test_unhoist_haloupdate_if_invariant(self):
+        """
+        Test an Operator that computes coupled equations in which the first
+        one *does require* a halo update on a Dimension-invariant Function.
+        """
+        grid = Grid(shape=(10,))
+        x = grid.dimensions[0]
+        t = grid.stepping_dim
+
+        f = Function(name='f', grid=grid)
+        u = TimeFunction(name='u', grid=grid)
+
+        f.data_with_halo[:] = 2.
+        u.data_with_halo[:] = 1.
+
+        eqns = [Eq(u.forward, u + f[x-1] + f[x+1] + 1.),
+                Eq(f, u[t+1, x-1] + u[t+1, x+1] + 1.)]
+
+        op = Operator(eqns)
+        op.apply(time=1)
+
+        calls = FindNodes(Call).visit(op)
+        assert len(calls) == 2
+
+        glb_pos_map = grid.distributor.glb_pos_map
+        R = 1e-07
+        if LEFT in glb_pos_map[x]:
+            assert np.allclose(f.data_ro_domain[:5], [30., 56., 62., 67., 67.], rtol=R)
+        else:
+            assert np.allclose(f.data_ro_domain[5:], [67., 67., 62., 56., 30.], rtol=R)
 
     @pytest.mark.parallel(mode=[(2, 'basic'), (2, 'diag')])
     def test_redo_haloupdate_due_to_antidep(self):
@@ -817,6 +889,136 @@ class TestCodeGeneration(object):
         else:
             assert np.all(g.data_ro_domain[1, :-1] == 2.)
 
+    @pytest.mark.parallel(mode=[(1, 'full')])
+    def test_avoid_fullmode_if_crossloop_dep(self):
+        grid = Grid(shape=(4, 4))
+        x, y = grid.dimensions
+
+        f = Function(name='f', grid=grid)
+        g = Function(name='g', grid=grid)
+
+        f.data_with_halo[:] = 0.
+        g.data_with_halo[:] = 1.
+
+        op = Operator([Eq(f, g[x, y-1] + g[x, y+1]),
+                       Eq(g, f)])
+
+        # Exactly 4 routines will be generated for the basic mode
+        assert len(op._func_table) == 4
+
+        # Also check the numerical values
+        op.apply()
+        assert np.all(f.data[:] == 2.)
+
+    @pytest.mark.parallel(mode=2)
+    def test_avoid_haloudate_if_flowdep_along_other_dim(self):
+        grid = Grid(shape=(10,))
+        x = grid.dimensions[0]
+        t = grid.stepping_dim
+
+        xl = SubDimension.left(name='xl', parent=x, thickness=2)
+
+        f = TimeFunction(name='f', grid=grid)
+        g = TimeFunction(name='g', grid=grid)
+
+        f.data_with_halo[:] = 1.2
+        g.data_with_halo[:] = 2.
+
+        # Note: the subdomain is used to prevent the compiler from fusing the
+        # third Eq in the first Eq's loop
+        eqns = [Eq(f.forward, f[t, x-1] + f[t, x+1]),
+                Eq(f[t+1, xl], f[t+1, xl] + 1.),
+                Eq(g.forward, f[t, x-1] + f[t, x+1], subdomain=grid.interior)]
+
+        op = Operator(eqns)
+
+        calls = FindNodes(Call).visit(op)
+        assert len(calls) == 1
+
+        op.apply(time_M=1)
+        glb_pos_map = f.grid.distributor.glb_pos_map
+        R = 1e-07  # Can't use np.all due to rounding error at the tails
+        if LEFT in glb_pos_map[x]:
+            assert np.allclose(f.data_ro_domain[0, :5], [5.6, 6.8, 5.8, 4.8, 4.8], rtol=R)
+            assert np.allclose(g.data_ro_domain[0, :5], [2., 5.8, 5.8, 4.8, 4.8], rtol=R)
+        else:
+            assert np.allclose(f.data_ro_domain[0, 5:], [4.8, 4.8, 4.8, 4.8, 3.6], rtol=R)
+            assert np.allclose(g.data_ro_domain[0, 5:], [4.8, 4.8, 4.8, 4.8, 2.], rtol=R)
+
+    @pytest.mark.parallel(mode=2)
+    def test_unmerge_haloudate_if_diff_locindices(self):
+        """
+        In the Operator there are three Eqs:
+
+        * the first one does *not* require a halo update
+        * the second one requires a halo update for `f` at `t+1`
+        * the third one requires a halo update for `f` at `t`
+
+        Also:
+
+        * the second and third Eqs cannot be fused in the same loop
+
+        So in the IET we end up with two HaloSpots, one for the second and one
+        for the third Eqs. These will *not* be merged because they operate at
+        different `t`-indices (`t+1` and `t`).
+        """
+        grid = Grid(shape=(10,))
+        x = grid.dimensions[0]
+        t = grid.stepping_dim
+
+        f = TimeFunction(name='f', grid=grid, space_order=2)
+        g = TimeFunction(name='g', grid=grid)
+        h = TimeFunction(name='h', grid=grid)
+
+        f.data_with_halo[:] = 1.2
+        g.data_with_halo[:] = 2.
+        h.data_with_halo[:] = 3.1
+
+        # Note: the subdomain is used to prevent the compiler from fusing the
+        # third Eq in the second Eq's loop
+        eqns = [Eq(f.forward, f + 1.),
+                Eq(g.forward, f[t+1, x-1] + f[t+1, x+1]),
+                Eq(h.forward, f[t, x-2] + f[t, x+2], subdomain=grid.interior)]
+
+        op = Operator(eqns)
+
+        calls = FindNodes(Call).visit(op)
+        assert len(calls) == 2
+
+        op.apply(time_M=1)
+        glb_pos_map = f.grid.distributor.glb_pos_map
+        R = 1e-07  # Can't use np.all due to rounding error at the tails
+        if LEFT in glb_pos_map[x]:
+            assert np.allclose(g.data_ro_domain[0, :5], [4.4, 6.4, 6.4, 6.4, 6.4], rtol=R)
+            assert np.allclose(h.data_ro_domain[0, :5], [3.1, 3.4, 4.4, 4.4, 4.4], rtol=R)
+        else:
+            assert np.allclose(g.data_ro_domain[0, 5:], [6.4, 6.4, 6.4, 6.4, 4.4], rtol=R)
+            assert np.allclose(h.data_ro_domain[0, 5:], [4.4, 4.4, 4.4, 3.4, 3.1], rtol=R)
+
+    @pytest.mark.parallel(mode=1)
+    def test_conditional_dimension(self):
+        """
+        Test the case of Functions in the condition of a ConditionalDimension.
+        """
+        grid = Grid(shape=(4, 4))
+        x, y = grid.dimensions
+        t = grid.stepping_dim
+
+        f = TimeFunction(name='f', grid=grid)
+        g = Function(name='g', grid=grid)
+        h = TimeFunction(name='h', grid=grid, space_order=2)
+
+        cd = ConditionalDimension(name='cd', parent=x, condition=~Ne(g, h[t, x+1, y]))
+
+        eqns = [Eq(f.forward, f + 1, implicit_dims=cd),
+                Eq(g, h + 1)]
+
+        op = Operator(eqns)
+
+        # No halo update here because the `x` Iteration is SEQUENTIAL
+        calls = FindNodes(Call).visit(op)
+        assert len(calls) == 0
+
     @pytest.mark.parametrize('expr,expected', [
         ('f[t,x-1,y] + f[t,x+1,y]', {'rc', 'lc'}),
         ('f[t,x,y-1] + f[t,x,y+1]', {'cr', 'cl'}),
@@ -835,9 +1037,9 @@ class TestCodeGeneration(object):
 
         f = TimeFunction(name='f', grid=grid)  # noqa
 
-        op = Operator(Eq(f.forward, eval(expr)), dle=('advanced', {'openmp': False}))
+        op = Operator(Eq(f.forward, eval(expr)), opt=('advanced', {'openmp': False}))
 
-        calls = FindNodes(Call).visit(op._func_table['haloupdate0'])
+        calls = FindNodes(Call).visit(op._func_table['haloupdate_0'])
         destinations = {i.arguments[-2].field for i in calls}
         assert destinations == expected
 
@@ -850,7 +1052,7 @@ class TestCodeGeneration(object):
         f = TimeFunction(name='f', grid=grid)
 
         eqn = Eq(f.forward, f[t, x-1, y] + f[t, x+1, y] + f[t, x, y-1] + f[t, x, y+1])
-        op = Operator(eqn)
+        op = Operator(eqn, opt=('advanced', {'par-dynamic-work': 0}))
 
         trees = retrieve_iteration_tree(op._func_table['compute0'].root)
         assert len(trees) == 2
@@ -861,7 +1063,7 @@ class TestCodeGeneration(object):
         call = tree.root.nodes[1]
         assert call.name == 'pokempi0'
         assert call.arguments[0].name == 'msg0'
-        if configuration['openmp']:
+        if configuration['language'] == 'openmp':
             # W/ OpenMP, we prod until all comms have completed
             assert call.then_body[0].body[0].is_While
             # W/ OpenMP, we expect dynamic thread scheduling
@@ -872,7 +1074,7 @@ class TestCodeGeneration(object):
 
         # Now we do as before, but enforcing loop blocking (by default off,
         # as heuristically it is not enabled when the Iteration nest has depth < 3)
-        op = Operator(eqn, dle=('advanced', {'blockinner': True}))
+        op = Operator(eqn, opt=('advanced', {'blockinner': True, 'par-dynamic-work': 0}))
         trees = retrieve_iteration_tree(op._func_table['bf0'].root)
         assert len(trees) == 2
         tree = trees[1]
@@ -882,7 +1084,7 @@ class TestCodeGeneration(object):
         call = tree.root.nodes[0].nodes[1]
         assert call.name == 'pokempi0'
         assert call.arguments[0].name == 'msg0'
-        if configuration['openmp']:
+        if configuration['language'] == 'openmp':
             # W/ OpenMP, we prod until all comms have completed
             assert call.then_body[0].body[0].is_While
             # W/ OpenMP, we expect dynamic thread scheduling
@@ -1423,7 +1625,6 @@ class TestOperatorAdvanced(object):
         assert (np.isclose(norm(f), 17.24904, atol=1e-4, rtol=0))
 
     @pytest.mark.parallel(mode=[(4, 'basic'), (4, 'overlap2', True)])
-    @patch("devito.passes.clusters.aliases.MIN_COST_ALIAS", 1)
     def test_aliases(self):
         """
         Check correctness when the DSE extracts aliases and places them
@@ -1450,8 +1651,8 @@ class TestOperatorAdvanced(object):
 
         eqn = Eq(u.forward, ((u[t, x, y] + u[t, x+1, y+1])*3*f +
                              (u[t, x+2, y+2] + u[t, x+3, y+3])*3*f + 1))
-        op0 = Operator(eqn, dse='noop')
-        op1 = Operator(eqn, dse='aggressive')
+        op0 = Operator(eqn, opt='noop')
+        op1 = Operator(eqn, opt=('advanced', {'cire-mincost-sops': 1}))
 
         op0(time_M=1)
         u0_norm = norm(u)
@@ -1463,7 +1664,6 @@ class TestOperatorAdvanced(object):
         assert u0_norm == u1_norm
 
     @pytest.mark.parallel(mode=[(4, 'overlap2', True)])
-    @patch("devito.passes.clusters.aliases.MIN_COST_ALIAS", 1)
     def test_aliases_with_shifted_diagonal_halo_touch(self):
         """
         Like ``test_aliases`` but now the diagonal halos required to compute
@@ -1482,8 +1682,8 @@ class TestOperatorAdvanced(object):
 
         eqn = Eq(u.forward, ((u[t, x, y] + u[t, x+2, y])*3*f +
                              (u[t, x+1, y+1] + u[t, x+3, y+1])*3*f + 1))
-        op0 = Operator(eqn, dse='noop')
-        op1 = Operator(eqn, dse='aggressive')
+        op0 = Operator(eqn, opt='noop')
+        op1 = Operator(eqn, opt=('advanced', {'cire-mincost-sops': 1}))
 
         op0(time_M=1)
         u0_norm = norm(u)
@@ -1595,13 +1795,102 @@ class TestOperatorAdvanced(object):
         assert np.all(u.data[1, -1:] == 1.)
         assert np.all(u.data[1, :, 1:] == 1.)
 
+    @pytest.mark.parallel(mode=[(4, 'basic'), (4, 'full')])
+    def test_misc_subdims_3D(self):
+        """
+        Test `SubDims` in 3D (so that spatial blocking is introduced).
+
+        Derived from issue https://github.com/devitocodes/devito/issues/1309
+        """
+        grid = Grid(shape=(12, 12, 12))
+        x, y, z = grid.dimensions
+        t = grid.stepping_dim
+
+        u = TimeFunction(name='u', grid=grid)
+        u.data_with_halo[:] = 1.
+
+        xi = SubDimension.middle(name='xi', parent=x, thickness_left=2, thickness_right=2)
+        yi = SubDimension.middle(name='yi', parent=y, thickness_left=2, thickness_right=2)
+        zi = SubDimension.middle(name='zi', parent=z, thickness_left=2, thickness_right=2)
+
+        # A 7 point stencil expression
+        eqn = Eq(u[t+1, xi, yi, zi], (u[t, xi, yi, zi]
+                                      + u[t, xi-1, yi, zi] + u[t, xi+1, yi, zi]
+                                      + u[t, xi, yi-1, zi] + u[t, xi, yi+1, zi]
+                                      + u[t, xi, yi, zi-1] + u[t, xi, yi, zi+1]))
+
+        op = Operator(eqn)
+
+        op(time_M=0)
+
+        # Also try running it
+        assert np.all(u.data[1, 2:-2, 2:-2, 2:-2] == 7.)
+        assert np.all(u.data[1, 0:2, :, :] == 1.)
+        assert np.all(u.data[1, -2:, :, :] == 1.)
+        assert np.all(u.data[1, :, 0:2, :] == 1.)
+        assert np.all(u.data[1, :, -2:, :] == 1.)
+        assert np.all(u.data[1, :, :, 0:2] == 1.)
+        assert np.all(u.data[1, :, :, -2:] == 1.)
+
+    @pytest.mark.parallel(mode=[(4, 'full')])
+    def test_custom_subdomain(self):
+        """
+        This test uses a custom SubDomain such that we end up with two loop
+        nests with a data dependence across them inducing two halo exchanges,
+        one for each loop nests. A crucial aspect of this test is that the data
+        dependence is across a Dimension (xl) that does *not* require a halo
+        exchange (xl is a local SubDimension). Unlike more typical cases of
+        when a dependence occurs along time, here the dependence distance goes
+        to infinity (there are indeed two consecutive separate loop nests), so
+        a halo exchange *is* required even though the halo Dimension (y) is not
+        the one inducing the dependence.
+        """
+
+        class mydomain(SubDomain):
+            name = 'd1'
+
+            def define(self, dimensions):
+                x, y = dimensions
+                return {x: ('left', 2), y: y}
+
+        mydomain = mydomain()
+
+        grid = Grid(shape=(8, 8), subdomains=mydomain)
+
+        x, y = grid.dimensions
+        t = grid.stepping_dim
+
+        u = TimeFunction(name="u", grid=grid)
+        v = TimeFunction(name="v", grid=grid)
+
+        u.data[:] = 0.6
+        v.data[:] = 0.4
+
+        eqns = [Eq(u.forward, u[t, x, y-1] + 1, subdomain=grid.subdomains['d1']),
+                Eq(v.forward, u[t+1, x+1, y+1] + 1, subdomain=grid.subdomains['d1'])]
+
+        op = Operator(eqns, subs=grid.spacing_map)
+
+        # We expect 2 halo-exchange sets of calls, for a total of 8 calls
+        calls = FindNodes(Call).visit(op)
+        assert len(calls) == 8
+
+        # Compilation + run
+        op(time_M=4)
+
+        # Check numerical values
+        assert np.isclose(norm(u), 23.70654, atol=1e-5, rtol=0)
+        assert np.isclose(norm(v), 21.14994, atol=1e-5, rtol=0)
+
 
 def gen_serial_norms(shape, so):
     """
     Computes the norms of the outputs in serial mode to compare with
     """
+    day = np.datetime64('today')
     try:
-        np.load("norms%s.npy" % len(shape))
+        l = np.load("norms%s.npy" % len(shape), allow_pickle=True)
+        assert l[-1] == day
     except:
         tn = 500.  # Final time
         nrec = 130  # Number of receivers
@@ -1620,7 +1909,7 @@ def gen_serial_norms(shape, so):
         Ev = norm(v)
         Esrca = norm(srca)
 
-        np.save("norms%s.npy" % len(shape), (Eu, Erec, Ev, Esrca))
+        np.save("norms%s.npy" % len(shape), (Eu, Erec, Ev, Esrca, day), allow_pickle=True)
 
 
 class TestIsotropicAcoustic(object):
@@ -1636,9 +1925,9 @@ class TestIsotropicAcoustic(object):
 
     @cached_property
     def norms(self):
-        return {1: np.load("norms1.npy"),
-                2: np.load("norms2.npy"),
-                3: np.load("norms3.npy")}
+        return {1: np.load("norms1.npy", allow_pickle=True)[:-1],
+                2: np.load("norms2.npy", allow_pickle=True)[:-1],
+                3: np.load("norms3.npy", allow_pickle=True)[:-1]}
 
     @pytest.mark.parametrize('shape,kernel,space_order,save', [
         ((60, ), 'OT2', 4, False),

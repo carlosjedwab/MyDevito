@@ -5,58 +5,17 @@ Extended SymPy hierarchy.
 import numpy as np
 import sympy
 from sympy import Expr, Integer, Function, Symbol
-from sympy.core.basic import _aresame
 
 from devito.symbolics.printer import ccode
 from devito.tools import Pickable, as_tuple, is_integer
 
-__all__ = ['FrozenExpr', 'Eq', 'CondEq', 'CondNe', 'Mul', 'Add', 'Pow', 'IntDiv',
-           'FunctionFromPointer', 'FieldFromPointer', 'FieldFromComposite',
-           'ListInitializer', 'Byref', 'IndexedPointer', 'Macro', 'Literal',
-           'INT', 'FLOAT', 'DOUBLE', 'FLOOR', 'cast_mapper']
+__all__ = ['CondEq', 'CondNe', 'IntDiv', 'FunctionFromPointer', 'FieldFromPointer',
+           'FieldFromComposite', 'ListInitializer', 'Byref', 'IndexedPointer',
+           'DefFunction', 'Macro', 'Literal', 'INT', 'FLOAT', 'DOUBLE', 'FLOOR',
+           'cast_mapper']
 
 
-class FrozenExpr(Expr):
-
-    """
-    Use FrozenExpr in place of sympy.Expr to make sure than an e an expression
-    is no longer transformable; that is, standard manipulations such as
-    xreplace, collect, expand, ... have no effect, thus building a new
-    expression identical to self.
-
-    Notes
-    -----
-    At the moment, only xreplace is overridded (to prevent unpicking factorizations)
-    """
-
-    def xreplace(self, rule):
-        if self in rule:
-            return rule[self]
-        elif rule:
-            args = []
-            for a in self.args:
-                try:
-                    args.append(a.xreplace(rule))
-                except AttributeError:
-                    args.append(a)
-            args = tuple(args)
-            if not _aresame(args, self.args):
-                return self.func(*args, evaluate=False)
-        return self
-
-    def evalf(self, *args, **kwargs):
-        return self
-
-
-class Eq(sympy.Eq, FrozenExpr):
-
-    """A customized version of sympy.Eq which suppresses evaluation."""
-
-    def __new__(cls, *args, **kwargs):
-        return sympy.Eq.__new__(cls, *args, evaluate=False)
-
-
-class CondEq(sympy.Eq, FrozenExpr):
+class CondEq(sympy.Eq):
 
     """
     A customized version of sympy.Eq representing a conditional equality.
@@ -75,7 +34,7 @@ class CondEq(sympy.Eq, FrozenExpr):
         return CondNe(*self.args, evaluate=False)
 
 
-class CondNe(sympy.Ne, FrozenExpr):
+class CondNe(sympy.Ne):
 
     """
     A customized version of sympy.Ne representing a conditional inequality.
@@ -92,21 +51,6 @@ class CondNe(sympy.Ne, FrozenExpr):
     @property
     def negated(self):
         return CondEq(*self.args, evaluate=False)
-
-
-class Mul(sympy.Mul, FrozenExpr):
-    def __new__(cls, *args, **kwargs):
-        return sympy.Mul.__new__(cls, *args, evaluate=False)
-
-
-class Add(sympy.Add, FrozenExpr):
-    def __new__(cls, *args, **kwargs):
-        return sympy.Add.__new__(cls, *args, evaluate=False)
-
-
-class Pow(sympy.Pow, FrozenExpr):
-    def __new__(cls, *args, **kwargs):
-        return sympy.Pow.__new__(cls, *args, evaluate=False)
 
 
 class IntDiv(sympy.Expr):
@@ -313,7 +257,7 @@ class Byref(sympy.Expr, Pickable):
     __reduce_ex__ = Pickable.__reduce_ex__
 
 
-class IndexedPointer(sympy.Expr):
+class IndexedPointer(sympy.Expr, Pickable):
 
     """
     Symbolic representation of the C notation ``symbol[...]``
@@ -347,6 +291,40 @@ class IndexedPointer(sympy.Expr):
 
     # Pickling support
     _pickle_args = ['base', 'index']
+    __reduce_ex__ = Pickable.__reduce_ex__
+
+
+class DefFunction(Function, Pickable):
+
+    """
+    A definitely-defined sympy.Function, to work around:
+
+        https://github.com/sympy/sympy/issues/4297
+    """
+
+    def __new__(cls, name, arguments=None):
+        arguments = as_tuple(arguments)
+        obj = Function.__new__(cls, name, *arguments)
+        obj._name = name
+        obj._arguments = arguments
+        return obj
+
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def arguments(self):
+        return self._arguments
+
+    def __str__(self):
+        return "%s(%s)" % (self.name, ', '.join(str(i) for i in self.arguments))
+
+    __repr__ = __str__
+
+    # Pickling support
+    _pickle_args = ['name']
+    _pickle_kwargs = ['arguments']
     __reduce_ex__ = Pickable.__reduce_ex__
 
 

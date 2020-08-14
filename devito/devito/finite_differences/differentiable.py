@@ -6,8 +6,10 @@ from sympy.functions.elementary.integers import floor
 from sympy.core.evalf import evalf_table
 
 from cached_property import cached_property
+from devito.finite_differences.lazy import Evaluable
 from devito.logger import warning
-from devito.tools import Evaluable, EnrichedTuple, filter_ordered, flatten
+from devito.tools import filter_ordered, flatten
+from devito.types.utils import DimensionTuple
 
 __all__ = ['Differentiable']
 
@@ -85,7 +87,11 @@ class Differentiable(sympy.Expr, Evaluable):
     @property
     def indices_ref(self):
         """The reference indices of the object (indices at first creation)."""
-        return EnrichedTuple(*self.dimensions, getters=self.dimensions)
+        if len(self._args_diff) == 1:
+            return self._args_diff[0].indices_ref
+        elif len(self._args_diff) == 0:
+            return DimensionTuple(*self.dimensions, getters=self.dimensions)
+        return highest_priority(self).indices_ref
 
     @cached_property
     def staggered(self):
@@ -113,6 +119,27 @@ class Differentiable(sympy.Expr, Evaluable):
             # Cartesian grid, do no waste time
             return self
         return self.func(*[getattr(a, '_eval_at', lambda x: a)(func) for a in self.args])
+
+    def _subs(self, old, new, **hints):
+        if old is self:
+            return new
+        if old is new:
+            return self
+        args = list(self.args)
+        for i, arg in enumerate(args):
+            try:
+                args[i] = arg._subs(old, new, **hints)
+            except AttributeError:
+                continue
+        return self.func(*args, evaluate=False)
+
+    @property
+    def _eval_deriv(self):
+        return self.func(*[getattr(a, '_eval_deriv', a) for a in self.args])
+
+    @property
+    def _fd_priority(self):
+        return .75 if self.is_TimeDependent else .5
 
     def __hash__(self):
         return super(Differentiable, self).__hash__()
@@ -195,6 +222,13 @@ class Differentiable(sympy.Expr, Evaluable):
     def name(self):
         return "".join(f.name for f in self._functions)
 
+    def shift(self, dim, shift):
+        """
+        Shift  expression by `shift` along the Dimension `dim`.
+        For example u.shift(x, x.spacing) = u(x + h_x).
+        """
+        return self._subs(dim, dim + shift)
+
     @property
     def laplace(self):
         """
@@ -251,7 +285,14 @@ class Differentiable(sympy.Expr, Evaluable):
         return super(Differentiable, self)._has(pattern)
 
 
+def highest_priority(DiffOp):
+    prio = lambda x: getattr(x, '_fd_priority', 0)
+    return sorted(DiffOp._args_diff, key=prio, reverse=True)[0]
+
+
 class DifferentiableOp(Differentiable):
+
+    __sympy_class__ = None
 
     def __new__(cls, *args, **kwargs):
         obj = cls.__base__.__new__(cls, *args, **kwargs)
@@ -263,20 +304,100 @@ class DifferentiableOp(Differentiable):
 
         return obj
 
+    def subs(self, *args, **kwargs):
+        return self.func(*[getattr(a, 'subs', lambda x: a)(*args, **kwargs)
+                           for a in self.args], evaluate=False)
+
+    _subs = Differentiable._subs
+
+    @property
+    def _gather_for_diff(self):
+        return self
+
+    # Bypass useless expensive SymPy _eval_ methods, for which we either already
+    # know or don't care about the answer, because it'd have ~zero impact on our
+    # average expressions
+
+    def _eval_is_even(self):
+        return None
+
+    def _eval_is_odd(self):
+        return None
+
+    def _eval_is_integer(self):
+        return None
+
+    def _eval_is_negative(self):
+        return None
+
+    def _eval_is_extended_negative(self):
+        return None
+
+    def _eval_is_positive(self):
+        return None
+
+    def _eval_is_extended_positive(self):
+        return None
+
+    def _eval_is_zero(self):
+        return None
+
 
 class Add(DifferentiableOp, sympy.Add):
+    __sympy_class__ = sympy.Add
     __new__ = DifferentiableOp.__new__
 
 
 class Mul(DifferentiableOp, sympy.Mul):
+    __sympy_class__ = sympy.Mul
     __new__ = DifferentiableOp.__new__
+
+    @property
+    def _gather_for_diff(self):
+        """
+        We handle Mul arguments by hand in case of staggered inputs
+        such as `f(x)*g(x + h_x/2)` that will be transformed into
+        f(x + h_x/2)*g(x + h_x/2) and priority  of indexing is applied
+        to have single indices as in this example.
+        The priority is from least to most:
+            - param
+            - NODE
+            - staggered
+        """
+
+        if len(set(f.staggered for f in self._args_diff)) == 1:
+            return self
+
+        func_args = highest_priority(self)
+        new_args = []
+        ref_inds = func_args.indices_ref._getters
+
+        for f in self.args:
+            if f not in self._args_diff:
+                new_args.append(f)
+            elif f is func_args:
+                new_args.append(f)
+            else:
+                ind_f = f.indices_ref._getters
+                mapper = {ind_f.get(d, d): ref_inds.get(d, d)
+                          for d in self.dimensions
+                          if ind_f.get(d, d) is not ref_inds.get(d, d)}
+                if mapper:
+                    new_args.append(f.subs(mapper))
+                else:
+                    new_args.append(f)
+
+        return self.func(*new_args, evaluate=False)
 
 
 class Pow(DifferentiableOp, sympy.Pow):
+    _fd_priority = 0
+    __sympy_class__ = sympy.Pow
     __new__ = DifferentiableOp.__new__
 
 
 class Mod(DifferentiableOp, sympy.Mod):
+    __sympy_class__ = sympy.Mod
     __new__ = DifferentiableOp.__new__
 
 
@@ -338,6 +459,31 @@ class diffify(object):
     @_cls.register(Mod)
     def _(obj):
         return obj.__class__
+
+
+def diff2sympy(expr):
+    """
+    Translate a Differentiable expression into a SymPy expression.
+    """
+
+    def _diff2sympy(obj):
+        flag = False
+        args = []
+        for a in obj.args:
+            ax, af = _diff2sympy(a)
+            args.append(ax)
+            flag |= af
+        try:
+            return obj.__sympy_class__(*args, evaluate=False), True
+        except AttributeError:
+            # Not of type DifferentiableOp
+            pass
+        if flag:
+            return obj.func(*args, evaluate=False), True
+        else:
+            return obj, False
+
+    return _diff2sympy(expr)[0]
 
 
 # Make sure `sympy.evalf` knows how to evaluate the inherited classes

@@ -2,12 +2,14 @@ import os
 from subprocess import check_call
 
 import pytest
+import sys
 
 from sympy import cos, Symbol  # noqa
 
 from devito import (Grid, TimeDimension, SteppingDimension, SpaceDimension, # noqa
                     Constant, Function, TimeFunction, Eq, configuration, SparseFunction, # noqa
                     SparseTimeFunction)  # noqa
+from devito.archinfo import Device
 from devito.compiler import sniff_mpi_distro
 from devito.tools import as_tuple
 
@@ -22,8 +24,11 @@ def skipif(items, whole_module=False):
     items = as_tuple(items)
     # Sanity check
     accepted = set(configuration._accepted['backend'])
+    # TODO: to be refined in the near future, once we start adding support for
+    # multiple GPU languages (openmp, openacc, cuda, ...)
+    accepted.add('device')
     accepted.update({'no%s' % i for i in configuration._accepted['backend']})
-    accepted.update({'nompi'})
+    accepted.update({'nompi', 'nodevice'})
     unknown = sorted(set(items) - accepted)
     if unknown:
         raise ValueError("Illegal skipif argument(s) `%s`" % unknown)
@@ -41,11 +46,21 @@ def skipif(items, whole_module=False):
             break
         try:
             _, noi = i.split('no')
-            if noi != configuration['backend']:
-                skipit = "`%s` backend unsupported" % i
-                break
+            if noi in configuration._accepted['backend']:
+                if noi != configuration['backend']:
+                    skipit = "`%s` backend unsupported" % i
+                    break
         except ValueError:
             pass
+        # Skip if won't run on GPUs
+        if i == 'device' and isinstance(configuration['platform'], Device):
+            skipit = "device `%s` unsupported" % configuration['platform'].name
+            break
+        # Skip if must run GPUs but not currently on a GPU
+        if i == 'nodevice' and not isinstance(configuration['platform'], Device):
+            skipit = ("must run on device, but currently on `%s`" %
+                      configuration['platform'].name)
+            break
     if skipit is False:
         return pytest.mark.skipif(False, reason='')
     else:
@@ -111,16 +126,17 @@ def parallel(item):
             # run on the current machine
             continue
 
+        pyversion = sys.executable
         # Only spew tracebacks on rank 0.
         # Run xfailing tests to ensure that errors are reported to calling process
         if item.cls is not None:
             testname = "%s::%s::%s" % (item.fspath, item.cls.__name__, item.name)
         else:
             testname = "%s::%s" % (item.fspath, item.name)
-        args = ["-n", "1", "python", "-m", "pytest", "--runxfail", "-s",
+        args = ["-n", "1", pyversion, "-m", "pytest", "--runxfail", "-s",
                 "-q", testname]
         if nprocs > 1:
-            args.extend([":", "-n", "%d" % (nprocs - 1), "python", "-m", "pytest",
+            args.extend([":", "-n", "%d" % (nprocs - 1), pyversion, "-m", "pytest",
                          "--runxfail", "--tb=no", "-q", testname])
         # OpenMPI requires an explicit flag for oversubscription. We need it as some
         # of the MPI tests will spawn lots of processes

@@ -2,12 +2,9 @@ import numpy as np
 import pytest
 from numpy import linalg
 
-from conftest import skipif
 from devito import Function, info
 from examples.seismic.acoustic.acoustic_example import smooth, acoustic_setup as setup
 from examples.seismic import Receiver
-
-pytestmark = skipif(['yask', 'ops'])
 
 
 class TestGradient(object):
@@ -50,8 +47,8 @@ class TestGradient(object):
                             time_range=wave.geometry.time_axis,
                             coordinates=wave.geometry.rec_positions)
 
-        gradient, _ = wave.gradient(residual, u0, vp=v0, checkpointing=True)
-        gradient2, _ = wave.gradient(residual, u0, vp=v0, checkpointing=False)
+        gradient, _ = wave.jacobian_adjoint(residual, u0, vp=v0, checkpointing=True)
+        gradient2, _ = wave.jacobian_adjoint(residual, u0, vp=v0, checkpointing=False)
         assert np.allclose(gradient.data, gradient2.data)
 
     @pytest.mark.parametrize('space_order', [4])
@@ -97,7 +94,8 @@ class TestGradient(object):
                             time_range=wave.geometry.time_axis,
                             coordinates=wave.geometry.rec_positions)
 
-        gradient, _ = wave.gradient(residual, u0, vp=v0, checkpointing=checkpointing)
+        gradient, _ = wave.jacobian_adjoint(residual, u0, vp=v0,
+                                            checkpointing=checkpointing)
         G = np.dot(gradient.data.reshape(-1), dm.reshape(-1))
 
         # FWI Gradient test
@@ -157,7 +155,7 @@ class TestGradient(object):
         rec, u0, _ = wave.forward(vp=v0, save=False)
 
         # Gradient: J dm
-        Jdm, _, _, _ = wave.born(dm, rec=linrec, vp=v0)
+        Jdm, _, _, _ = wave.jacobian(dm, rec=linrec, vp=v0)
         # FWI Gradient test
         H = [0.5, 0.25, .125, 0.0625, 0.0312, 0.015625, 0.0078125]
         error1 = np.zeros(7)

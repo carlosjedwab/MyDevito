@@ -1,20 +1,18 @@
-from sympy import Eq, diff, cos, sin, nan
+from sympy import Eq, diff, nan
 
 from devito.tools import as_tuple, is_integer
 
 
-__all__ = ['q_leaf', 'q_indexed', 'q_terminal', 'q_trigonometry', 'q_routine', 'q_xop',
+__all__ = ['q_leaf', 'q_indexed', 'q_terminal', 'q_function', 'q_routine', 'q_xop',
            'q_terminalop', 'q_sum_of_product', 'q_indirect', 'q_constant', 'q_affine',
            'q_linear', 'q_identity', 'q_inc', 'q_scalar', 'q_multivar', 'q_monoaffine']
 
 
-"""
-The following SymPy objects are considered tree leaves:
-
-    * Number
-    * Symbol
-    * Indexed
-"""
+# The following SymPy objects are considered tree leaves:
+#
+# * Number
+# * Symbol
+# * Indexed
 
 
 def q_scalar(expr):
@@ -41,10 +39,6 @@ def q_terminal(expr):
     return expr.is_Symbol or expr.is_Indexed
 
 
-def q_trigonometry(expr):
-    return expr.is_Function and expr.func in [sin, cos]
-
-
 def q_routine(expr):
     from devito.types.basic import AbstractFunction
     return expr.is_Function and not isinstance(expr, AbstractFunction)
@@ -54,7 +48,12 @@ def q_xop(expr):
     return (expr.is_Add or expr.is_Mul or expr.is_Pow or q_routine(expr))
 
 
-def q_terminalop(expr):
+def q_terminalop(expr, depth=0):
+    assert depth >= 0
+
+    if depth > 0:
+        return all(q_leaf(a) or q_terminalop(a, depth-1) for a in expr.args)
+
     if expr.is_Function:
         return True
     elif expr.is_Add or expr.is_Mul:
@@ -72,8 +71,8 @@ def q_terminalop(expr):
         return False
 
 
-def q_sum_of_product(expr):
-    return q_leaf(expr) or q_terminalop(expr) or all(q_terminalop(i) for i in expr.args)
+def q_sum_of_product(expr, depth=1):
+    return q_leaf(expr) or q_terminalop(expr, depth)
 
 
 def q_indirect(expr):
@@ -131,22 +130,29 @@ def q_affine(expr, vars):
     Return True if ``expr`` is (separately) affine in the variables ``vars``,
     False otherwise.
 
-    Readapted from: https://stackoverflow.com/questions/36283548\
+    Notes
+    -----
+    Exploits:
+
+        https://stackoverflow.com/questions/36283548\
         /check-if-an-equation-is-linear-for-a-specific-set-of-variables/
     """
     vars = as_tuple(vars)
-    # If any `vars` does not appear in `expr`, the only possibility
-    # for `expr` to be affine is that it's a constant function
-    if any(x not in expr.atoms() for x in vars):
-        return q_constant(expr)
+    free_symbols = expr.free_symbols
+
     # At this point, `expr` is (separately) affine in the `vars` variables
     # if all non-mixed second order derivatives are identically zero.
     for x in vars:
+        if expr is x:
+            continue
+
+        if x not in free_symbols:
+            # At this point the only hope is that `expr` is constant
+            return q_constant(expr)
+
         # The vast majority of calls here are incredibly simple tests
         # like q_affine(x+1, [x]).  Catch these quickly and
         # explicitly, instead of calling the very slow function `diff`.
-        if expr is x:
-            continue
         if expr.is_Add and len(expr.args) == 2:
             if expr.args[1] is x and expr.args[0].is_Number:
                 continue
@@ -158,6 +164,7 @@ def q_affine(expr, vars):
                 return False
         except TypeError:
             return False
+
     return True
 
 

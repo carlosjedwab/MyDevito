@@ -13,13 +13,13 @@ import cgen as c
 from devito.exceptions import VisitorException
 from devito.ir.iet.nodes import Node, Iteration, Expression, Call
 from devito.ir.support.space import Backward
-from devito.symbolics import ccode
+from devito.symbolics import ccode, uxreplace
 from devito.tools import GenericVisitor, as_tuple, filter_sorted, flatten
+from devito.types.basic import AbstractFunction
 
 
 __all__ = ['FindNodes', 'FindSections', 'FindSymbols', 'MapExprStmts', 'MapNodes',
-           'IsPerfectIteration', 'XSubs', 'printAST', 'CGen', 'Transformer',
-           'FindAdjacent']
+           'IsPerfectIteration', 'XSubs', 'printAST', 'CGen', 'Transformer']
 
 
 class Visitor(GenericVisitor):
@@ -111,7 +111,7 @@ class PrintAST(Visitor):
         body = self._visit(o.children)
         self._depth -= 1
         if self.verbose:
-            detail = '::%s::%s::%s' % (o.index, o.limits, o.offsets)
+            detail = '::%s::%s' % (o.index, o.limits)
             props = [str(i) for i in o.properties]
             props = '[%s] ' % ','.join(props) if props else ''
         else:
@@ -190,7 +190,7 @@ class CGen(Visitor):
                     ret.append(self.visit(i).text)
                 elif i.is_LocalObject:
                     ret.append('&%s' % i._C_name)
-                elif i.is_Array:
+                elif i.is_ArrayBasic:
                     ret.append("(%s)%s" % (i._C_typename, i.name))
                 else:
                     ret.append(i._C_name)
@@ -198,19 +198,30 @@ class CGen(Visitor):
                 ret.append(ccode(i))
         return ret
 
-    def visit_ArrayCast(self, o):
+    def visit_PointerCast(self, o):
         f = o.function
-        # rvalue
-        shape = ''.join("[%s]" % ccode(i) for i in o.castshape)
-        if f.is_DiscreteFunction:
-            rvalue = '(%s (*)%s) %s->%s' % (f._C_typedata, shape, f._C_name,
-                                            f._C_field_data)
+        if f.is_PointerArray:
+            rvalue = '(%s**) %s' % (f._C_typedata, f._C_name)
+            lvalue = c.Value(f._C_typedata, '**%s' % f.name)
         else:
-            rvalue = '(%s (*)%s) %s' % (f._C_typedata, shape, f._C_name)
-        # lvalue
-        lvalue = c.AlignedAttribute(f._data_alignment,
-                                    c.Value(f._C_typedata,
-                                            '(*restrict %s)%s' % (f.name, shape)))
+            shape = ''.join("[%s]" % ccode(i) for i in o.castshape)
+            if f.is_DiscreteFunction:
+                rvalue = '(%s (*)%s) %s->%s' % (f._C_typedata, shape, f._C_name,
+                                                f._C_field_data)
+            else:
+                rvalue = '(%s (*)%s) %s' % (f._C_typedata, shape, f._C_name)
+            lvalue = c.AlignedAttribute(f._data_alignment,
+                                        c.Value(f._C_typedata,
+                                                '(*restrict %s)%s' % (f.name, shape)))
+        return c.Initializer(lvalue, rvalue)
+
+    def visit_Dereference(self, o):
+        a0, a1 = o.functions
+        shape = ''.join("[%s]" % ccode(i) for i in a0.symbolic_shape[1:])
+        rvalue = '(%s (*)%s) %s[%s]' % (a1._C_typedata, shape, a1.name, a1.dim.name)
+        lvalue = c.AlignedAttribute(a0._data_alignment,
+                                    c.Value(a0._C_typedata,
+                                            '(*restrict %s)%s' % (a0.name, shape)))
         return c.Initializer(lvalue, rvalue)
 
     def visit_tuple(self, o):
@@ -272,25 +283,8 @@ class CGen(Visitor):
     def visit_Iteration(self, o):
         body = flatten(self._visit(i) for i in o.children)
 
-        # Start
-        if o.offsets[0] != 0:
-            _min = str(o.limits[0] + o.offsets[0])
-            try:
-                _min = eval(_min)
-            except (NameError, TypeError):
-                pass
-        else:
-            _min = o.limits[0]
-
-        # Bound
-        if o.offsets[1] != 0:
-            _max = str(o.limits[1] + o.offsets[1])
-            try:
-                _max = eval(_max)
-            except (NameError, TypeError):
-                pass
-        else:
-            _max = o.limits[1]
+        _min = o.limits[0]
+        _max = o.limits[1]
 
         # For backward direction flip loop bounds
         if o.direction == Backward:
@@ -306,7 +300,11 @@ class CGen(Visitor):
         if o.uindices:
             uinit = ['%s = %s' % (i.name, ccode(i.symbolic_min)) for i in o.uindices]
             loop_init = c.Line(', '.join([loop_init] + uinit))
-            ustep = ['%s = %s' % (i.name, ccode(i.symbolic_incr)) for i in o.uindices]
+
+            ustep = []
+            for i in o.uindices:
+                op = '=' if i.is_Modulo else '+='
+                ustep.append('%s %s %s' % (i.name, op, ccode(i.symbolic_incr)))
             loop_inc = c.Line(', '.join([loop_inc] + ustep))
 
         # Create For header+body
@@ -533,15 +531,30 @@ class FindSymbols(Visitor):
     ----------
     mode : str, optional
         Drive the search. Accepted:
-        - ``symbolics``: Collect AbstractSymbol objects, default.
+        - ``symbolics``: Collect all AbstractFunction objects, default.
         - ``free-symbols``: Collect all free symbols.
+        - ``indexeds``: Collect all Indexeds.
         - ``defines``: Collect all defined (bound) objects.
     """
 
+    def _symbolics(e):
+        try:
+            return e.functions
+        except AttributeError:
+            # A SymPy expression
+            return [i for i in e.free_symbols if isinstance(i, AbstractFunction)]
+
+    def _defines(e):
+        try:
+            return as_tuple(e.defines)
+        except AttributeError:
+            return ()
+
     rules = {
-        'symbolics': lambda e: e.functions,
+        'symbolics': _symbolics,
         'free-symbols': lambda e: e.free_symbols,
-        'defines': lambda e: as_tuple(e.defines),
+        'indexeds': lambda e: [i for i in e.free_symbols if i.is_Indexed],
+        'defines': _defines,
     }
 
     def __init__(self, mode='symbolics'):
@@ -560,7 +573,12 @@ class FindSymbols(Visitor):
         return filter_sorted(symbols, key=attrgetter('name'))
 
     visit_List = visit_Iteration
-    visit_Conditional = visit_Iteration
+
+    def visit_Conditional(self, o):
+        symbols = flatten([self._visit(i) for i in o.children])
+        symbols += self.rule(o)
+        symbols += self.rule(o.condition)
+        return filter_sorted(symbols, key=attrgetter('name'))
 
     def visit_Expression(self, o):
         return filter_sorted([f for f in self.rule(o)], key=attrgetter('name'))
@@ -570,7 +588,8 @@ class FindSymbols(Visitor):
         symbols.extend([f for f in self.rule(o)])
         return filter_sorted(symbols, key=attrgetter('name'))
 
-    visit_ArrayCast = visit_Expression
+    visit_PointerCast = visit_Expression
+    visit_Dereference = visit_Expression
 
 
 class FindNodes(Visitor):
@@ -620,58 +639,6 @@ class FindNodes(Visitor):
             ret.append(o)
         for i in o.children:
             ret = self._visit(i, ret=ret)
-        return ret
-
-
-class FindAdjacent(Visitor):
-
-    @classmethod
-    def default_retval(cls):
-        return OrderedDict([('seen_type', False)])
-
-    """
-    Return a mapper from nodes N in an Expression/Iteration tree to sequences of
-    objects I = [I_0, I_1, ...] of type T, where N is the direct ancestor of
-    the items in I and all items in I are adjacent nodes in the tree.
-    """
-
-    def __init__(self, match):
-        super(FindAdjacent, self).__init__()
-        self.match = as_tuple(match)
-
-    def handler(self, o, parent=None, ret=None):
-        if ret is None:
-            ret = self.default_retval()
-        if parent is None:
-            return ret
-        group = []
-        for i in o:
-            ret = self._visit(i, parent=parent, ret=ret)
-            if i and ret['seen_type'] is True:
-                group.append(i)
-            else:
-                if len(group) > 1:
-                    ret.setdefault(parent, []).append(tuple(group))
-                # Reset the group, Iterations no longer adjacent
-                group = []
-        # Potential leftover
-        if len(group) > 1:
-            ret.setdefault(parent, []).append(tuple(group))
-        return ret
-
-    def _post_visit(self, ret):
-        ret.pop('seen_type', None)
-        return ret
-
-    def visit_object(self, o, parent=None, ret=None):
-        return ret
-
-    def visit_tuple(self, o, parent=None, ret=None):
-        return self.handler(o, parent=parent, ret=ret)
-
-    def visit_Node(self, o, parent=None, ret=None):
-        ret = self.handler(o.children, parent=o, ret=ret)
-        ret['seen_type'] = type(o) in self.match
         return ret
 
 
@@ -781,12 +748,18 @@ class XSubs(Transformer):
     mapper : dict, optional
         The substitution rules.
     replacer : callable, optional
-        An ad-hoc function to perform the substitution. Defaults to SymPy's ``subs``.
+        An ad-hoc function to perform the substitution. Defaults to ``uxreplace``.
     """
 
     def __init__(self, mapper=None, replacer=None):
         super(XSubs, self).__init__()
-        self.replacer = replacer or (lambda i: i.subs(mapper))
+        self.replacer = replacer or (lambda i: uxreplace(i, mapper))
+
+    def visit_Conditional(self, o):
+        condition = self.replacer(o.condition)
+        then_body = self._visit(o.then_body)
+        else_body = self._visit(o.else_body)
+        return o._rebuild(condition=condition, then_body=then_body, else_body=else_body)
 
     def visit_Expression(self, o):
         return o._rebuild(expr=self.replacer(o.expr))

@@ -3,22 +3,18 @@ from operator import mul
 
 import numpy as np
 import pytest
-from unittest.mock import patch
 
-from conftest import skipif
 from devito import (Grid, Function, TimeFunction, SparseTimeFunction, SubDimension,
-                    Eq, Operator, switchconfig)
+                    Eq, Operator)
 from devito.exceptions import InvalidArgument
 from devito.ir.iet import Call, Iteration, Conditional, FindNodes, retrieve_iteration_tree
-from devito.passes import BlockDimension, NThreads, NThreadsNonaffine
-from devito.passes.iet.openmp import ParallelRegion
+from devito.passes import NThreads, NThreadsNonaffine
+from devito.passes.iet.openmp import OpenMPRegion
 from devito.tools import as_tuple
 from devito.types import Scalar
 
-pytestmark = skipif(['yask', 'ops'])
 
-
-def get_blocksizes(op, dle, grid, blockshape, level=0):
+def get_blocksizes(op, opt, grid, blockshape, level=0):
     blocksizes = {'%s0_blk%d_size' % (d, level): v
                   for d, v in zip(grid.dimensions, blockshape)}
     blocksizes = {k: v for k, v in blocksizes.items() if k in op._known_arguments}
@@ -27,7 +23,7 @@ def get_blocksizes(op, dle, grid, blockshape, level=0):
         assert len(blocksizes) == 0
         return {}
     try:
-        if dle[1].get('blockinner'):
+        if opt[1].get('blockinner'):
             assert len(blocksizes) >= 1
             if grid.dim == len(blockshape):
                 assert len(blocksizes) == len(blockshape)
@@ -39,7 +35,7 @@ def get_blocksizes(op, dle, grid, blockshape, level=0):
         return {}
 
 
-def _new_operator2(shape, time_order, blockshape=None, dle=None):
+def _new_operator2(shape, time_order, blockshape=None, opt=None):
     blockshape = as_tuple(blockshape)
     grid = Grid(shape=shape, dtype=np.int32)
     infield = TimeFunction(name='infield', grid=grid, time_order=time_order)
@@ -48,15 +44,15 @@ def _new_operator2(shape, time_order, blockshape=None, dle=None):
 
     stencil = Eq(outfield.forward.indexify(),
                  outfield.indexify() + infield.indexify()*3.0)
-    op = Operator(stencil, dle=dle)
+    op = Operator(stencil, opt=opt)
 
-    blocksizes = get_blocksizes(op, dle, grid, blockshape)
+    blocksizes = get_blocksizes(op, opt, grid, blockshape)
     op(infield=infield, outfield=outfield, t=10, **blocksizes)
 
     return outfield, op
 
 
-def _new_operator3(shape, blockshape0=None, blockshape1=None, dle=None):
+def _new_operator3(shape, blockshape0=None, blockshape1=None, opt=None):
     blockshape0 = as_tuple(blockshape0)
     blockshape1 = as_tuple(blockshape1)
 
@@ -68,10 +64,10 @@ def _new_operator3(shape, blockshape0=None, blockshape1=None, dle=None):
     u.data[0, :] = np.linspace(-1, 1, reduce(mul, shape)).reshape(shape)
 
     # Derive the stencil according to devito conventions
-    op = Operator(Eq(u.forward, 0.5 * u.laplace + u), dle=dle)
+    op = Operator(Eq(u.forward, 0.5 * u.laplace + u), opt=opt)
 
-    blocksizes0 = get_blocksizes(op, dle, grid, blockshape0, 0)
-    blocksizes1 = get_blocksizes(op, dle, grid, blockshape1, 1)
+    blocksizes0 = get_blocksizes(op, opt, grid, blockshape0, 0)
+    blocksizes1 = get_blocksizes(op, opt, grid, blockshape1, 1)
     op.apply(u=u, t=10, **blocksizes0, **blocksizes1)
 
     return u.data[1, :], op
@@ -79,8 +75,8 @@ def _new_operator3(shape, blockshape0=None, blockshape1=None, dle=None):
 
 @pytest.mark.parametrize("shape", [(41,), (20, 33), (45, 31, 45)])
 def test_composite_transformation(shape):
-    wo_blocking, _ = _new_operator2(shape, time_order=2, dle='noop')
-    w_blocking, _ = _new_operator2(shape, time_order=2, dle='advanced')
+    wo_blocking, _ = _new_operator2(shape, time_order=2, opt='noop')
+    w_blocking, _ = _new_operator2(shape, time_order=2, opt='advanced')
 
     assert np.equal(wo_blocking.data, w_blocking.data).all()
 
@@ -89,29 +85,28 @@ def test_composite_transformation(shape):
     (False, 4, 5),
     (True, 8, 6)
 ])
-@patch("devito.passes.iet.openmp.Ompizer.COLLAPSE_NCORES", 1)
 def test_cache_blocking_structure(blockinner, exp_calls, exp_iters):
     # Check code structure
     _, op = _new_operator2((10, 31, 45), time_order=2,
-                           dle=('blocking', {'blockinner': blockinner}))
+                           opt=('blocking', {'blockinner': blockinner,
+                                             'par-collapse-ncores': 1}))
     calls = FindNodes(Call).visit(op)
     assert len(calls) == exp_calls
     trees = retrieve_iteration_tree(op._func_table['bf0'].root)
     assert len(trees) == 1
     tree = trees[0]
     assert len(tree) == exp_iters
-    assert isinstance(tree[0].dim, BlockDimension)
-    assert isinstance(tree[1].dim, BlockDimension)
     if blockinner:
-        assert isinstance(tree[2].dim, BlockDimension)
+        assert all(tree[i].dim.is_Incr for i in range(exp_iters))
     else:
-        assert not isinstance(tree[2].dim, BlockDimension)
-    assert not isinstance(tree[3].dim, BlockDimension)
-    assert not isinstance(tree[4].dim, BlockDimension)
+        assert all(tree[i].dim.is_Incr for i in range(exp_iters-1))
+        assert not tree[-1].dim.is_Incr
 
     # Check presence of openmp pragmas at the right place
     _, op = _new_operator2((10, 31, 45), time_order=2,
-                           dle=('blocking', {'openmp': True, 'blockinner': blockinner}))
+                           opt=('blocking', {'openmp': True,
+                                             'blockinner': blockinner,
+                                             'par-collapse-ncores': 1}))
     trees = retrieve_iteration_tree(op._func_table['bf0'].root)
     assert len(trees) == 1
     tree = trees[0]
@@ -137,6 +132,7 @@ def test_cache_blocking_structure_subdims():
     """
     grid = Grid(shape=(4, 4, 4))
     x, y, z = grid.dimensions
+    xi, yi, zi = grid.interior.dimensions
     t = grid.stepping_dim
     xl = SubDimension.left(name='xl', parent=x, thickness=4)
 
@@ -154,9 +150,43 @@ def test_cache_blocking_structure_subdims():
     assert len(trees) == 1
     tree = trees[0]
     assert len(tree) == 5
-    assert isinstance(tree[0].dim, BlockDimension) and tree[0].dim.root is x
-    assert isinstance(tree[1].dim, BlockDimension) and tree[1].dim.root is y
-    assert not isinstance(tree[2].dim, BlockDimension)
+    assert tree[0].dim.is_Incr and tree[0].dim.parent is xi and tree[0].dim.root is x
+    assert tree[1].dim.is_Incr and tree[1].dim.parent is yi and tree[1].dim.root is y
+    assert tree[2].dim.is_Incr and tree[2].dim.parent is tree[0].dim and\
+        tree[2].dim.root is x
+    assert tree[3].dim.is_Incr and tree[3].dim.parent is tree[1].dim and\
+        tree[3].dim.root is y
+    assert not tree[4].dim.is_Incr and tree[4].dim is zi and tree[4].dim.parent is z
+
+
+@pytest.mark.parallel(mode=[(1, 'full')])  # Shortcut to put loops in nested efuncs
+def test_cache_blocking_structure_multiple_efuncs():
+    """
+    Test cache blocking in multiple nested elemental functions.
+    """
+    grid = Grid(shape=(4, 4, 4))
+    x, y, z = grid.dimensions
+
+    u = TimeFunction(name="u", grid=grid, space_order=2)
+    U = TimeFunction(name="U", grid=grid, space_order=2)
+    src = SparseTimeFunction(name="src", grid=grid, nt=3, npoint=1,
+                             coordinates=np.array([(0.5, 0.5, 0.5)]))
+
+    eqns = [Eq(u.forward, u.dx)]
+    eqns += src.inject(field=u.forward, expr=src)
+    eqns += [Eq(U.forward, U.dx + u.forward)]
+
+    op = Operator(eqns)
+
+    for i in ['bf0', 'bf1']:
+        assert i in op._func_table
+        iters = FindNodes(Iteration).visit(op._func_table[i].root)
+        assert len(iters) == 5
+        assert iters[0].dim.parent is x
+        assert iters[1].dim.parent is y
+        assert iters[4].dim is z
+        assert iters[2].dim.parent is iters[0].dim
+        assert iters[3].dim.parent is iters[1].dim
 
 
 @pytest.mark.parametrize("shape", [(10,), (10, 45), (20, 33), (10, 31, 45), (45, 31, 45)])
@@ -164,9 +194,9 @@ def test_cache_blocking_structure_subdims():
 @pytest.mark.parametrize("blockshape", [2, (3, 3), (9, 20), (2, 9, 11), (7, 15, 23)])
 @pytest.mark.parametrize("blockinner", [False, True])
 def test_cache_blocking_time_loop(shape, time_order, blockshape, blockinner):
-    wo_blocking, _ = _new_operator2(shape, time_order, dle='noop')
+    wo_blocking, _ = _new_operator2(shape, time_order, opt='noop')
     w_blocking, _ = _new_operator2(shape, time_order, blockshape,
-                                   dle=('blocking', {'blockinner': blockinner}))
+                                   opt=('blocking', {'blockinner': blockinner}))
 
     assert np.equal(wo_blocking.data, w_blocking.data).all()
 
@@ -187,9 +217,9 @@ def test_cache_blocking_time_loop(shape, time_order, blockshape, blockinner):
 ])
 def test_cache_blocking_edge_cases(shape, blockshape):
     time_order = 2
-    wo_blocking, _ = _new_operator2(shape, time_order, dle='noop')
+    wo_blocking, _ = _new_operator2(shape, time_order, opt='noop')
     w_blocking, _ = _new_operator2(shape, time_order, blockshape,
-                                   dle=('blocking', {'blockinner': True}))
+                                   opt=('blocking', {'blockinner': True}))
     assert np.equal(wo_blocking.data, w_blocking.data).all()
 
 
@@ -209,8 +239,8 @@ def test_cache_blocking_edge_cases(shape, blockshape):
     ((15, 15), (3, 4))
 ])
 def test_cache_blocking_edge_cases_highorder(shape, blockshape):
-    wo_blocking, a = _new_operator3(shape, dle='noop')
-    w_blocking, b = _new_operator3(shape, blockshape, dle=('blocking',
+    wo_blocking, a = _new_operator3(shape, opt='noop')
+    w_blocking, b = _new_operator3(shape, blockshape, opt=('blocking',
                                                            {'blockinner': True}))
 
     assert np.allclose(wo_blocking, w_blocking, rtol=1e-12)
@@ -229,10 +259,10 @@ def test_cache_blocking_edge_cases_highorder(shape, blockshape):
 def test_cache_blocking_hierarchical(blockshape0, blockshape1, exception):
     shape = (51, 102, 71)
 
-    wo_blocking, a = _new_operator3(shape, dle='noop')
+    wo_blocking, a = _new_operator3(shape, opt='noop')
     try:
         w_blocking, b = _new_operator3(shape, blockshape0, blockshape1,
-                                       dle=('blocking', {'blockinner': True,
+                                       opt=('blocking', {'blockinner': True,
                                                          'blocklevels': 2}))
         assert not exception
         assert np.allclose(wo_blocking, w_blocking, rtol=1e-12)
@@ -242,11 +272,12 @@ def test_cache_blocking_hierarchical(blockshape0, blockshape1, exception):
         assert False
 
 
-def test_cache_blocking_unsupported():
+@pytest.mark.parametrize("blockinner", [False, True])
+def test_cache_blocking_imperfect_nest(blockinner):
     """
-    Test that a non-perfect Iteration nest is not blocked.
+    Test that a non-perfect Iteration nest is blocked correctly.
     """
-    grid = Grid(shape=(4, 4, 4))
+    grid = Grid(shape=(4, 4, 4), dtype=np.float64)
 
     u = TimeFunction(name='u', grid=grid, space_order=2)
     v = TimeFunction(name='v', grid=grid, space_order=2)
@@ -254,12 +285,78 @@ def test_cache_blocking_unsupported():
     eqns = [Eq(u.forward, v.laplace),
             Eq(v.forward, u.forward.dz)]
 
-    op = Operator(eqns)
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt=('advanced', {'blockinner': blockinner}))
 
-    assert not op._func_table
-
-    trees = retrieve_iteration_tree(op)
+    # First, check the generated code
+    trees = retrieve_iteration_tree(op1._func_table['bf0'].root)
     assert len(trees) == 2
+    assert len(trees[0]) == len(trees[1])
+    assert all(i is j for i, j in zip(trees[0][:4], trees[1][:4]))
+    assert trees[0][4] is not trees[1][4]
+    assert trees[0].root.dim.is_Incr
+    assert trees[1].root.dim.is_Incr
+    assert op1.parameters[8] is trees[0][0].step
+    assert op1.parameters[11] is trees[0][1].step
+
+    u.data[:] = 0.2
+    v.data[:] = 1.5
+    op0(time_M=0)
+
+    u1 = TimeFunction(name='u1', grid=grid, space_order=2)
+    v1 = TimeFunction(name='v1', grid=grid, space_order=2)
+
+    u1.data[:] = 0.2
+    v1.data[:] = 1.5
+    op1(u=u1, v=v1, time_M=0)
+
+    assert np.all(u.data == u1.data)
+    assert np.all(v.data == v1.data)
+
+
+@pytest.mark.parametrize("blockinner", [False, True])
+def test_cache_blocking_imperfect_nest_v2(blockinner):
+    """
+    Test that a non-perfect Iteration nest is blocked correctly. This
+    is slightly different than ``test_cache_blocking_imperfect_nest``
+    as here only one Iteration gets blocked.
+    """
+    shape = (16, 16, 16)
+    grid = Grid(shape=shape, dtype=np.float64)
+
+    u = TimeFunction(name='u', grid=grid, space_order=2)
+    u.data[:] = np.linspace(0, 1, reduce(mul, shape), dtype=np.float64).reshape(shape)
+
+    eq = Eq(u.forward, 0.01*u.dy.dy)
+
+    op0 = Operator(eq, opt='noop')
+    op1 = Operator(eq, opt=('cire-sops', {'blockinner': blockinner}))
+    op2 = Operator(eq, opt=('advanced-fsg', {'blockinner': blockinner}))
+
+    # First, check the generated code
+    trees = retrieve_iteration_tree(op2._func_table['bf0'].root)
+    assert len(trees) == 2
+    assert len(trees[0]) == len(trees[1])
+    assert all(i is j for i, j in zip(trees[0][:2], trees[1][:2]))
+    assert trees[0][2] is not trees[1][2]
+    assert trees[0].root.dim.is_Incr
+    assert trees[1].root.dim.is_Incr
+    assert op2.parameters[7] is trees[0].root.step
+
+    op0(time_M=0)
+
+    u1 = TimeFunction(name='u1', grid=grid, space_order=2)
+    u1.data[:] = np.linspace(0, 1, reduce(mul, shape), dtype=np.float64).reshape(shape)
+
+    op1(time_M=0, u=u1)
+
+    u2 = TimeFunction(name='u2', grid=grid, space_order=2)
+    u2.data[:] = np.linspace(0, 1, reduce(mul, shape), dtype=np.float64).reshape(shape)
+
+    op2(time_M=0, u=u2)
+
+    assert np.allclose(u.data, u1.data, rtol=1e-07)
+    assert np.allclose(u.data, u2.data, rtol=1e-07)
 
 
 class TestNodeParallelism(object):
@@ -316,7 +413,7 @@ class TestNodeParallelism(object):
         for e in exprs:
             eqns.append(eval(e))
 
-        op = Operator(eqns, dle='openmp')
+        op = Operator(eqns, opt='openmp')
 
         iterations = FindNodes(Iteration).visit(op)
         assert len(iterations) == len(expected)
@@ -340,9 +437,9 @@ class TestNodeParallelism(object):
         eqns = [Eq(f.forward, f + 1)]
         eqns += sf.interpolate(f)
 
-        op = Operator(eqns, dle='openmp')
+        op = Operator(eqns, opt='openmp')
 
-        parregions = FindNodes(ParallelRegion).visit(op)
+        parregions = FindNodes(OpenMPRegion).visit(op)
         assert len(parregions) == 2
 
         # Check suitable `num_threads` appear in the generated code
@@ -374,8 +471,6 @@ class TestNodeParallelism(object):
         ('[Eq(u, 2*u)]', [3, 0, 0, 0, 0, 0], True),
         ('[Eq(u, 2*u), Eq(f, u.dzr)]', [0, 2, 0, 0, 0], False)
     ])
-    @patch("devito.passes.iet.openmp.Ompizer.COLLAPSE_NCORES", 1)
-    @patch("devito.passes.iet.openmp.Ompizer.COLLAPSE_WORK", 0)
     def test_collapsing(self, eqns, expected, blocking):
         grid = Grid(shape=(3, 3, 3))
 
@@ -385,10 +480,13 @@ class TestNodeParallelism(object):
         eqns = eval(eqns)
 
         if blocking:
-            op = Operator(eqns, dle=('blocking', 'simd', 'openmp', {'blockinner': True}))
+            op = Operator(eqns, opt=('blocking', 'simd', 'openmp',
+                                     {'blockinner': True, 'par-collapse-ncores': 1,
+                                      'par-collapse-work': 0}))
             iterations = FindNodes(Iteration).visit(op._func_table['bf0'])
         else:
-            op = Operator(eqns, dle=('simd', 'openmp'))
+            op = Operator(eqns, opt=('simd', 'openmp', {'par-collapse-ncores': 1,
+                                                        'par-collapse-work': 0}))
             iterations = FindNodes(Iteration).visit(op)
 
         assert len(iterations) == len(expected)
@@ -416,7 +514,7 @@ class TestNodeParallelism(object):
         eqns = [Eq(u.forward, u + 1)]
         eqns += sf1.interpolate(u)
 
-        op = Operator(eqns, dle='openmp')
+        op = Operator(eqns, opt=('openmp', {'par-dynamic-work': 0}))
 
         iterations = FindNodes(Iteration).visit(op)
         assert len(iterations) == 4
@@ -428,14 +526,15 @@ class TestNodeParallelism(object):
 
 class TestNestedParallelism(object):
 
-    @patch("devito.passes.iet.openmp.Ompizer.NESTED", 0)
-    @patch("devito.passes.iet.openmp.Ompizer.COLLAPSE_NCORES", 10000)
     def test_basic(self):
         grid = Grid(shape=(3, 3, 3))
 
         u = TimeFunction(name='u', grid=grid)
 
-        op = Operator(Eq(u.forward, u + 1), dle=('blocking', 'openmp'))
+        op = Operator(Eq(u.forward, u + 1),
+                      opt=('blocking', 'openmp', {'par-nested': 0,
+                                                  'par-collapse-ncores': 10000,
+                                                  'par-dynamic-work': 0}))
 
         # Does it compile? Honoring the OpenMP specification isn't trivial
         assert op.cfunction
@@ -458,15 +557,16 @@ class TestNestedParallelism(object):
                                                   'schedule(dynamic,1) '
                                                   'num_threads(nthreads_nested)')
 
-    @patch("devito.passes.iet.openmp.Ompizer.NESTED", 0)
-    @patch("devito.passes.iet.openmp.Ompizer.COLLAPSE_NCORES", 1)
-    @patch("devito.passes.iet.openmp.Ompizer.COLLAPSE_WORK", 0)
     def test_collapsing(self):
         grid = Grid(shape=(3, 3, 3))
 
         u = TimeFunction(name='u', grid=grid)
 
-        op = Operator(Eq(u.forward, u + 1), dle=('blocking', 'openmp'))
+        op = Operator(Eq(u.forward, u + 1),
+                      opt=('blocking', 'openmp', {'par-nested': 0,
+                                                  'par-collapse-ncores': 1,
+                                                  'par-collapse-work': 0,
+                                                  'par-dynamic-work': 0}))
 
         # Does it compile? Honoring the OpenMP specification isn't trivial
         assert op.cfunction
@@ -481,78 +581,32 @@ class TestNestedParallelism(object):
                                                   'schedule(dynamic,1) '
                                                   'num_threads(nthreads_nested)')
 
-    @patch("devito.passes.clusters.aliases.MIN_COST_ALIAS", 1)
-    @patch("devito.passes.iet.openmp.Ompizer.NESTED", 0)
-    @patch("devito.passes.iet.openmp.Ompizer.COLLAPSE_NCORES", 10000)
     def test_multiple_subnests(self):
         grid = Grid(shape=(3, 3, 3))
         x, y, z = grid.dimensions
         t = grid.stepping_dim
 
         f = Function(name='f', grid=grid)
-        u = TimeFunction(name='u', grid=grid)
+        u = TimeFunction(name='u', grid=grid, space_order=3)
 
         eqn = Eq(u.forward, ((u[t, x, y, z] + u[t, x+1, y+1, z+1])*3*f +
                              (u[t, x+2, y+2, z+2] + u[t, x+3, y+3, z+3])*3*f + 1))
-        op = Operator(eqn, dse='aggressive', dle=('advanced', {'openmp': True}))
+        op = Operator(eqn,
+                      opt=('advanced', {'openmp': True,
+                                        'cire-mincost-sops': 1,
+                                        'par-nested': 0,
+                                        'par-collapse-ncores': 1,
+                                        'par-dynamic-work': 0}))
 
         trees = retrieve_iteration_tree(op._func_table['bf0'].root)
         assert len(trees) == 2
 
         assert trees[0][0] is trees[1][0]
         assert trees[0][0].pragmas[0].value ==\
-            'omp for collapse(1) schedule(dynamic,1)'
-        assert trees[0][2].pragmas[0].value == ('omp parallel for collapse(1) '
+            'omp for collapse(2) schedule(dynamic,1)'
+        assert trees[0][2].pragmas[0].value == ('omp parallel for collapse(2) '
                                                 'schedule(dynamic,1) '
                                                 'num_threads(nthreads_nested)')
-        assert trees[1][2].pragmas[0].value == ('omp parallel for collapse(1) '
+        assert trees[1][2].pragmas[0].value == ('omp parallel for collapse(2) '
                                                 'schedule(dynamic,1) '
                                                 'num_threads(nthreads_nested)')
-
-
-class TestOffloading(object):
-
-    @switchconfig(platform='nvidiaX')
-    def test_basic(self):
-        grid = Grid(shape=(3, 3, 3))
-
-        u = TimeFunction(name='u', grid=grid)
-
-        op = Operator(Eq(u.forward, u + 1), dle=('advanced', {'openmp': True}))
-
-        trees = retrieve_iteration_tree(op)
-        assert len(trees) == 1
-
-        assert trees[0][1].pragmas[0].value ==\
-            'omp target teams distribute parallel for collapse(3)'
-        assert op.body[1].header[1].value ==\
-            ('omp target enter data map(to: u[0:u_vec->size[0]]'
-             '[0:u_vec->size[1]][0:u_vec->size[2]][0:u_vec->size[3]])')
-        assert op.body[1].footer[0].value ==\
-            ('omp target exit data map(from: u[0:u_vec->size[0]]'
-             '[0:u_vec->size[1]][0:u_vec->size[2]][0:u_vec->size[3]])')
-
-    @switchconfig(platform='nvidiaX')
-    def test_multiple_eqns(self):
-        grid = Grid(shape=(3, 3, 3))
-
-        u = TimeFunction(name='u', grid=grid)
-        v = TimeFunction(name='v', grid=grid)
-
-        op = Operator([Eq(u.forward, u + v + 1), Eq(v.forward, u + v + 4)],
-                      dle=('advanced', {'openmp': True}))
-
-        trees = retrieve_iteration_tree(op)
-        assert len(trees) == 1
-
-        assert trees[0][1].pragmas[0].value ==\
-            'omp target teams distribute parallel for collapse(3)'
-        for i, f in enumerate([u, v]):
-            assert op.body[2].header[2 + i].value ==\
-                ('omp target enter data map(to: %(n)s[0:%(n)s_vec->size[0]]'
-                 '[0:%(n)s_vec->size[1]][0:%(n)s_vec->size[2]][0:%(n)s_vec->size[3]])' %
-                 {'n': f.name})
-            assert op.body[2].footer[i].value ==\
-                ('omp target exit data map(from: %(n)s[0:%(n)s_vec->size[0]]'
-                 '[0:%(n)s_vec->size[1]][0:%(n)s_vec->size[2]][0:%(n)s_vec->size[3]])' %
-                 {'n': f.name})

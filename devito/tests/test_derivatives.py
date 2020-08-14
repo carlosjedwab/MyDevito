@@ -1,11 +1,11 @@
 import numpy as np
 import pytest
-from sympy import simplify, diff, cos, sin
+from sympy import simplify, diff, cos, sin, Float
 
-from conftest import skipif
 from devito import (Grid, Function, TimeFunction, Eq, Operator, NODE,
                     ConditionalDimension, left, right, centered)
 from devito.finite_differences import Derivative, Differentiable
+from devito.symbolics import indexify, retrieve_indexed
 
 _PRECISION = 9
 
@@ -26,7 +26,6 @@ def t(grid):
     return grid.stepping_dim
 
 
-@skipif(['yask', 'ops'])
 class TestFD(object):
     """
     Class for finite difference testing.
@@ -43,6 +42,19 @@ class TestFD(object):
         u = Function(name='u', grid=self.grid)
         du = u.diff(x(self.grid))
         assert isinstance(du, Derivative)
+
+    @pytest.mark.parametrize('so', [2, 3, 4, 5])
+    def test_fd_indices(self, so):
+        """
+        Test that shifted derivative have Integer offset after indexification.
+        """
+        grid = Grid((10,))
+        x = grid.dimensions[0]
+        x0 = x + .5 * x.spacing
+        u = Function(name="u", grid=grid, space_order=so)
+        dx = indexify(u.dx(x0=x0).evaluate)
+        for f in retrieve_indexed(dx):
+            assert len(f.indices[0].atoms(Float)) == 0
 
     @pytest.mark.parametrize('SymbolType, dim', [
         (Function, x), (Function, y),
@@ -295,6 +307,64 @@ class TestFD(object):
 
         assert np.isclose(np.mean(error), 0., atol=1e-3)
 
+    @pytest.mark.parametrize('so', [2, 4, 6, 8])
+    def test_fd_new_order(self, so):
+        grid = Grid((10,))
+        u = Function(name="u", grid=grid, space_order=so)
+        u1 = Function(name="u", grid=grid, space_order=so//2)
+        u2 = Function(name="u", grid=grid, space_order=2*so)
+        assert str(u.dx(fd_order=so//2).evaluate) == str(u1.dx.evaluate)
+        assert str(u.dx(fd_order=2*so).evaluate) == str(u2.dx.evaluate)
+
+    def test_fd_new_side(self):
+        grid = Grid((10,))
+        u = Function(name="u", grid=grid, space_order=4)
+        assert u.dx(side=left).evaluate == u.dxl.evaluate
+        assert u.dx(side=right).evaluate == u.dxr.evaluate
+        assert u.dxl(side=centered).evaluate == u.dx.evaluate
+
+    @pytest.mark.parametrize('so, expected', [
+        (2, '1.0*u(x)/h_x - 1.0*u(x - 1.0*h_x)/h_x'),
+        (4, '1.125*u(x)/h_x + 0.0416666667*u(x - 2.0*h_x)/h_x - '
+            '1.125*u(x - 1.0*h_x)/h_x - 0.0416666667*u(x + 1.0*h_x)/h_x'),
+        (6, '1.171875*u(x)/h_x - 0.0046875*u(x - 3.0*h_x)/h_x + '
+            '0.0651041667*u(x - 2.0*h_x)/h_x - 1.171875*u(x - 1.0*h_x)/h_x - '
+            '0.0651041667*u(x + 1.0*h_x)/h_x + 0.0046875*u(x + 2.0*h_x)/h_x'),
+        (8, '1.19628906*u(x)/h_x + 0.000697544643*u(x - 4.0*h_x)/h_x - '
+            '0.0095703125*u(x - 3.0*h_x)/h_x + 0.0797526042*u(x - 2.0*h_x)/h_x - '
+            '1.19628906*u(x - 1.0*h_x)/h_x - 0.0797526042*u(x + 1.0*h_x)/h_x + '
+            '0.0095703125*u(x + 2.0*h_x)/h_x - 0.000697544643*u(x + 3.0*h_x)/h_x')])
+    def test_fd_new_x0(self, so, expected):
+        grid = Grid((10,))
+        x = grid.dimensions[0]
+        u = Function(name="u", grid=grid, space_order=so)
+        assert u.dx(x0=x + x.spacing).evaluate == u.dx.evaluate.subs({x: x + x.spacing})
+        assert u.dx(x0=x - x.spacing).evaluate == u.dx.evaluate.subs({x: x - x.spacing})
+        # half shifted compare to explicit coeffs (Forneberg)
+        assert str(u.dx(x0=x - .5 * x.spacing).evaluate) == expected
+
+    def test_new_x0_eval_at(self):
+        """
+        Make sure that explicitly set x0 does not get overwritten by eval_at.
+        """
+        grid = Grid((10,))
+        x = grid.dimensions[0]
+        u = Function(name="u", grid=grid, space_order=2)
+        v = Function(name="v", grid=grid, space_order=2)
+        assert u.dx(x0=x - x.spacing/2)._eval_at(v).x0 == {x: x - x.spacing/2}
+
+    def test_fd_new_lo(self):
+        grid = Grid((10,))
+        x = grid.dimensions[0]
+        u = Function(name="u", grid=grid, space_order=2)
+
+        dplus = "-1.0*u(x)/h_x + 1.0*u(x + 1.0*h_x)/h_x"
+        dminus = "1.0*u(x)/h_x - 1.0*u(x - 1.0*h_x)/h_x"
+        assert str(u.dx(x0=x + .5 * x.spacing).evaluate) == dplus
+        assert str(u.dx(x0=x - .5 * x.spacing).evaluate) == dminus
+        assert str(u.dx(x0=x + .5 * x.spacing, fd_order=1).evaluate) == dplus
+        assert str(u.dx(x0=x - .5 * x.spacing, fd_order=1).evaluate) == dminus
+
     def test_subsampled_fd(self):
         """
         Test that the symbolic interface is working for space subsampled
@@ -316,7 +386,7 @@ class TestFD(object):
                 u2.data_with_halo[i, :, j] = np.arange(u2.data_with_halo.shape[2])
 
         eqns = [Eq(u.forward, u + 1.), Eq(u2.forward, u2.dx)]
-        op = Operator(eqns, dse="advanced")
+        op = Operator(eqns)
         op.apply(time_M=nt-2)
         # Verify that u2[1, x,y]= du2/dx[0, x, y]
 
@@ -375,7 +445,7 @@ class TestFD(object):
         deriv = getattr(f, derivative)
         coeff = 1 if derivative == 'dx2' else -1
         expected = coeff * getattr(f, derivative).evaluate.subs({x.spacing: -x.spacing})
-        assert deriv.T.evaluate == expected
+        assert simplify(deriv.T.evaluate) == simplify(expected)
 
         # Compute numerical derivatives and verify dot test
         #  i.e <f.dx, g> = <f, g.dx.T>

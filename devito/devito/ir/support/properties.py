@@ -34,13 +34,6 @@ VECTORIZED = Property('vector-dim')
 TILABLE = Property('tilable')
 """A fully parallel Dimension that would benefit from tiling (or "blocking")."""
 
-WRAPPABLE = Property('wrappable')
-"""
-A modulo-N Dimension (i.e., cycling over i, i+1, i+2, ..., i+N-1) that could
-safely be turned into a modulo-K Dimension, with K < N. For example:
-u[t+1, ...] = f(u[t, ...]) + u[t-1, ...] --> u[t+1, ...] = f(u[t, ...]) + u[t+1, ...].
-"""
-
 ROUNDABLE = Property('roundable')
 """
 A Dimension whose upper limit may be rounded up to a multiple of the SIMD
@@ -75,27 +68,3 @@ def normalize_properties(*args):
         properties.update(p - drop)
 
     return properties
-
-
-class HaloSpotProperty(Tag):
-    pass
-
-
-OVERLAPPABLE = HaloSpotProperty('overlappable')
-"""The HaloSpot supports computation-communication overlap."""
-
-
-def hoistable(i):
-    """
-    The HaloSpot can be squashed with a previous HaloSpot as all data dependences
-    would still be honored.
-    """
-    return HaloSpotProperty('hoistable', i)
-
-
-def useless(i):
-    """
-    The HaloSpot can be ignored as a halo update at this point would be completely
-    useless.
-    """
-    return HaloSpotProperty('useless', i)

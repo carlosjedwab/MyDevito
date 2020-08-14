@@ -1,202 +1,86 @@
-from collections import OrderedDict, namedtuple
+from collections import namedtuple
 from collections.abc import Iterable
+from functools import singledispatch
 
 import sympy
 from sympy import Number, Indexed, Symbol, LM, LC
+from sympy.core.add import _addsort
+from sympy.core.mul import _mulsort
 
-from devito.symbolics.extended_sympy import Add, Mul, Pow, Eq, FrozenExpr
 from devito.symbolics.search import retrieve_indexed, retrieve_functions
-from devito.tools import as_tuple, flatten, split
+from devito.tools import as_tuple, flatten
+from devito.types.equation import Eq
 
-__all__ = ['freeze', 'unfreeze', 'evaluate', 'yreplace', 'xreplace_indices',
-           'pow_to_mul', 'as_symbol', 'indexify', 'split_affine']
+__all__ = ['xreplace_indices', 'pow_to_mul', 'as_symbol', 'indexify',
+           'split_affine', 'subs_op_args', 'uxreplace', 'aligned_indices']
 
 
-def freeze(expr):
+def uxreplace(expr, rule):
     """
-    Reconstruct ``expr`` turning all sympy.Mul and sympy.Add
-    into FrozenExpr equivalents.
+    An alternative to SymPy's ``xreplace`` for when the caller can guarantee
+    that no re-evaluations are necessary or when re-evaluations should indeed
+    be avoided at all costs (e.g., to prevent SymPy from unpicking Devito
+    transformations, such as factorization).
+
+    The canonical ordering of the arguments is however guaranteed; where this is
+    not possible, a re-evaluation will be enforced.
+
+    By avoiding re-evaluations, this function is typically much quicker than
+    SymPy's xreplace.
     """
-    if expr.is_Atom or expr.is_Indexed:
-        return expr
-    elif expr.is_Add:
-        rebuilt_args = [freeze(e) for e in expr.args]
-        return Add(*rebuilt_args, evaluate=False)
-    elif expr.is_Mul:
-        rebuilt_args = [freeze(e) for e in expr.args]
-        return Mul(*rebuilt_args, evaluate=False)
-    elif expr.is_Pow:
-        rebuilt_args = [freeze(e) for e in expr.args]
-        return Pow(*rebuilt_args, evaluate=False)
-    elif expr.is_Equality:
-        rebuilt_args = [freeze(e) for e in expr.args]
-        if isinstance(expr, FrozenExpr):
-            # Avoid dropping metadata associated with /expr/
-            return expr.func(*rebuilt_args)
-        else:
-            return Eq(*rebuilt_args, evaluate=False)
+    return _uxreplace(expr, rule)[0]
+
+
+def _uxreplace(expr, rule):
+    """
+    Helper for uxreplace.
+    """
+    if expr in rule:
+        return rule[expr], True
+    elif rule:
+        args = []
+        changed = False
+        for a in expr.args:
+            try:
+                ax, flag = _uxreplace(a, rule)
+                args.append(ax)
+                changed |= flag
+            except AttributeError:
+                # E.g., un-sympified numbers
+                args.append(a)
+        if changed:
+            return _uxreplace_handle(expr, args), True
+    return expr, False
+
+
+@singledispatch
+def _uxreplace_handle(expr, args):
+    return expr.func(*args)
+
+
+@_uxreplace_handle.register(sympy.Add)
+def _(expr, args):
+    if all(i.is_commutative for i in args):
+        _addsort(args)  # In-place sorting
+        return expr.func(*args, evaluate=False)
     else:
-        return expr.func(*[freeze(e) for e in expr.args])
+        return expr._new_rawargs(*args)
 
 
-def unfreeze(expr):
-    """
-    Reconstruct ``expr`` turning all FrozenExpr subtrees into their
-    SymPy equivalents.
-    """
-    if expr.is_Atom or expr.is_Indexed:
-        return expr
-    func = expr.func.__base__ if isinstance(expr, FrozenExpr) else expr.func
-    return func(*[unfreeze(e) for e in expr.args])
-
-
-def evaluate(expr, **subs):
-    """
-    Numerically evaluate a SymPy expression. Subtrees of type FrozenExpr
-    are forcibly evaluated.
-    """
-    expr = unfreeze(expr)
-    return expr.subs(subs)
-
-
-def yreplace(exprs, make, rule=None, costmodel=lambda e: True, repeat=False, eager=False):
-    """
-    Unlike SymPy's ``xreplace``, which performs structural replacement based on a mapper,
-    ``yreplace`` applies replacements using two callbacks:
-
-        * The "matching rule" -- a boolean function telling whether an expression
-          honors a certain property.
-        * The "cost model" -- a boolean function telling whether an expression exceeds
-          a certain (e.g., operation count) cost.
-
-    Parameters
-    ----------
-    exprs : expr-like or list of expr-like
-        One or more expressions searched for replacements.
-    make : dict or callable
-        Either a mapper of substitution rules (just like in ``xreplace``), or
-        or a callable returning unique symbols each time it is called.
-    rule : callable, optional
-        The matching rule (see above). Unnecessary if ``make`` is a dict.
-    costmodel : callable, optional
-        The cost model (see above).
-    repeat : bool, optional
-        If True, repeatedly apply ``xreplace`` until no more replacements are
-        possible. Defaults to False.
-    eager : bool, optional
-        If True, replaces an expression ``e`` as soon as the condition
-        ``rule(e) and costmodel(e)`` is True. Otherwise, the search continues
-        for larger, more expensive expressions. Defaults to False.
-
-    Notes
-    -----
-    In general, there is no relationship between the set of expressions for which
-    the matching rule gives True and the set of expressions passing the cost test.
-    For example, in the expression `a + b` all of `a`, `b` and `a+b` may satisfy
-    the matching rule, whereas only `a+b` satisfy the cost test. Likewise, an
-    expression may pass the cost test, but not satisfy the matching rule.
-    """
-    found = OrderedDict()
-    rebuilt = []
-
-    # Define `replace()` based on the user-provided `make`
-    if isinstance(make, dict):
-        rule = rule if rule is not None else (lambda i: i in make)
-        replace = lambda i: make[i]
+@_uxreplace_handle.register(sympy.Mul)
+def _(expr, args):
+    if all(i.is_commutative for i in args):
+        _mulsort(args)  # In-place sorting
+        return expr.func(*args, evaluate=False)
     else:
-        assert callable(make) and callable(rule)
+        return expr._new_rawargs(*args)
 
-        def replace(expr):
-            temporary = found.get(expr)
-            if not temporary:
-                temporary = make()
-                found[expr] = temporary
-            return temporary
 
-    def run(expr):
-        if expr.is_Atom or expr.is_Indexed:
-            return expr, rule(expr)
-        elif expr.is_Pow:
-            base, flag = run(expr.base)
-            if flag and costmodel(base):
-                return expr.func(replace(base), expr.exp, evaluate=False), False
-            elif flag and costmodel(expr):
-                return replace(expr), False
-            else:
-                return expr.func(base, expr.exp, evaluate=False), rule(expr)
-        else:
-            children = [run(a) for a in expr.args]
-            matching = [a for a, flag in children if flag]
-            other = [a for a, _ in children if a not in matching]
-
-            if not matching:
-                return expr.func(*other, evaluate=False), False
-
-            if eager is False:
-                matched = expr.func(*matching, evaluate=False)
-                if len(matching) == len(children) and rule(expr):
-                    # Go look for larger expressions first
-                    return matched, True
-                elif rule(matched) and costmodel(matched):
-                    # E.g.: a*b*c*d -> a*r0
-                    rebuilt = expr.func(*(other + [replace(matched)]), evaluate=False)
-                    return rebuilt, False
-                else:
-                    # E.g.: a*b*c*d -> a*r0*r1*r2
-                    replaced = [replace(e) for e in matching if costmodel(e)]
-                    unreplaced = [e for e in matching if not costmodel(e)]
-                    rebuilt = expr.func(*(other + replaced + unreplaced), evaluate=False)
-                    return rebuilt, False
-            else:
-                replaceable, unreplaced = split(matching, lambda e: costmodel(e))
-                if replaceable:
-                    # E.g.: a*b*c*d -> a*r0*r1*r2
-                    replaced = [replace(e) for e in replaceable]
-                    rebuilt = expr.func(*(other + replaced + unreplaced), evaluate=False)
-                    return rebuilt, False
-                matched = expr.func(*matching, evaluate=False)
-                if rule(matched) and costmodel(matched):
-                    if len(matching) == len(children):
-                        # E.g.: a*b*c*d -> r0
-                        return replace(matched), False
-                    else:
-                        # E.g.: a*b*c*d -> a*r0
-                        rebuilt = expr.func(*(other + [replace(matched)]), evaluate=False)
-                        return rebuilt, False
-                elif len(matching) == len(children) and rule(expr):
-                    # Go look for larger expressions
-                    return matched, True
-                else:
-                    # E.g.: a*b*c*d; a,b,a*b replaceable but not satisfying the cost
-                    # model, hence giving up as c,d,c*d aren't replaceable
-                    return expr.func(*(matching + other), evaluate=False), False
-
-    # Process the provided expressions
-    built = []
-    for expr in as_tuple(exprs):
-        assert expr.is_Equality
-        root = expr.rhs
-
-        while True:
-            ret, flag = run(root)
-
-            # The whole RHS may need to be replaced
-            if flag and costmodel(ret):
-                if expr.lhs.function.is_Array:
-                    ret = root
-                else:
-                    ret = replace(root)
-
-            if repeat and ret != root:
-                root = ret
-            else:
-                rebuilt.append(expr.func(expr.lhs, ret, evaluate=False))
-                break
-
-        # Construct Eqs for temporaries
-        built.extend(expr.func(v, k) for k, v in list(found.items())[len(built):])
-
-    return built + rebuilt, built
+@_uxreplace_handle.register(Eq)
+def _(expr, args):
+    # Preserve properties such as `implicit_dims`
+    return expr.func(*args, subdomain=expr.subdomain, coefficients=expr.substitutions,
+                     implicit_dims=expr.implicit_dims)
 
 
 def xreplace_indices(exprs, mapper, key=None, only_rhs=False):
@@ -224,7 +108,7 @@ def xreplace_indices(exprs, mapper, key=None, only_rhs=False):
     elif callable(key):
         handle = [i for i in handle if key(i)]
     mapper = dict(zip(handle, [i.xreplace(mapper) for i in handle]))
-    replaced = [i.xreplace(mapper) for i in as_tuple(exprs)]
+    replaced = [uxreplace(i, mapper) for i in as_tuple(exprs)]
     return replaced if isinstance(exprs, Iterable) else replaced[0]
 
 
@@ -233,14 +117,20 @@ def pow_to_mul(expr):
         return expr
     elif expr.is_Pow:
         base, exp = expr.as_base_exp()
-        if exp > 10 or exp < -10 or int(exp) != exp or exp == 0 or exp == -1:
-            # Large and non-integer powers remain untouched, as do reciprocals
+        if exp > 10 or exp < -10 or int(exp) != exp or exp == 0:
+            # Large and non-integer powers remain untouched
             return expr
+        elif exp == -1:
+            # Reciprocals also remain untouched, but we traverse the base
+            # looking for other Pows
+            return expr.func(pow_to_mul(base), exp, evaluate=False)
         elif exp > 0:
-            return sympy.Mul(*[base]*exp, evaluate=False)
+            return sympy.Mul(*[base]*int(exp), evaluate=False)
         else:
-            # sympy represents 1/x as Pow(x,-1)
-            posexpr = sympy.Mul(*[base]*(-exp), evaluate=False)
+            # SymPy represents 1/x as Pow(x,-1). Also, it represents
+            # 2/x as Mul(2, Pow(x, -1)). So we shouldn't end up here,
+            # but just in case SymPy changes its internal conventions...
+            posexpr = sympy.Mul(*[base]*(-int(exp)), evaluate=False)
             return sympy.Pow(posexpr, -1, evaluate=False)
     else:
         return expr.func(*[pow_to_mul(i) for i in expr.args], evaluate=False)
@@ -313,3 +203,24 @@ def indexify(expr):
         except AttributeError:
             pass
     return expr.xreplace(mapper)
+
+
+def aligned_indices(i, j, spacing):
+    """
+    Check if two indices are aligned. Two indices are aligned if they
+    differ by an Integer*spacing.
+    """
+    try:
+        return int((i - j)/spacing) == (i - j)/spacing
+    except TypeError:
+        return False
+
+
+def subs_op_args(expr, args):
+    """
+    Substitute Operator argument values into an expression. `args` is
+    expected to be as produced by `Operator.arguments` -- it can only
+    contain string keys, with values that are not themselves expressions
+    which will be substituted into.
+    """
+    return expr.subs({i.name: args[i.name] for i in expr.free_symbols if i.name in args})

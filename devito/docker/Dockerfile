@@ -13,12 +13,12 @@ RUN python3 -m venv /venv && \
     /venv/bin/pip install --no-cache-dir -r /app/requirements.txt && \
     /venv/bin/pip install --no-cache-dir -r /app/requirements-optional.txt
 
+ADD ./meus /app/meus
+
 ADD ./devito /app/devito
 ADD ./tests /app/tests
 ADD ./examples /app/examples
 ADD ./benchmarks /app/benchmarks
-ADD ./data /app/data
-ADD ./meus /app/meus
 COPY setup.cfg /app/
 
 ADD docker/run-jupyter.sh /jupyter
@@ -35,7 +35,7 @@ RUN chmod +x \
 WORKDIR /app
 
 ENV DEVITO_ARCH="gcc"
-ENV DEVITO_OPENMP="1"
+ENV DEVITO_LANGUAGE="openmp"
 
 EXPOSE 8888
 ENTRYPOINT ["/docker-entrypoint.sh"]

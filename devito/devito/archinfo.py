@@ -1,13 +1,15 @@
 """Collection of utilities to detect properties of the underlying architecture."""
 
-from subprocess import PIPE, Popen
+from subprocess import PIPE, Popen, DEVNULL
 
-import numpy as np
+from cached_property import cached_property
 import cpuinfo
+import numpy as np
 import psutil
+import re
 
 from devito.logger import warning
-from devito.tools.memoization import memoized_func
+from devito.tools import all_equal, memoized_func
 
 __all__ = ['platform_registry',
            'INTEL64', 'SNB', 'IVB', 'HSW', 'BDW', 'SKX', 'KNL', 'KNL7210',
@@ -118,6 +120,135 @@ def get_cpu_info():
 
 
 @memoized_func
+def get_gpu_info():
+    """Attempt GPU info autodetection."""
+
+    # Filter out virtual GPUs from a list of GPU dictionaries
+    def filter_real_gpus(gpus):
+        def is_real_gpu(gpu):
+            return 'virtual' not in gpu['product'].lower()
+        return filter(is_real_gpu, gpus)
+
+    # The following functions of the form cmd_gpu_info(...) attempt obtaining GPU
+    #   information using 'cmd'
+    # The currently supported ways of obtaining GPU information (in order of attempt) are:
+    #   - 'lshw' from the command line
+    #   - 'lspci' from the command line
+
+    def lshw_gpu_info(text):
+        def lshw_single_gpu_info(text):
+            # Separate the output into lines for processing
+            lines = text.replace('\\n', '\n')
+            lines = lines.splitlines()
+
+            # Define the processing functions
+            if lines:
+                def extract_gpu_info(keyword):
+                    for line in lines:
+                        if line.lstrip().startswith(keyword):
+                            return line.split(':')[1].lstrip()
+
+                def parse_product_arch():
+                    for line in lines:
+                        if line.lstrip().startswith('product') and '[' in line:
+                            arch_match = re.search(r'\[([\w\s]+)\]', line)
+                            if arch_match:
+                                return arch_match.group(1)
+                    return 'unspecified'
+
+                # Populate the information
+                gpu_info = {}
+                gpu_info['product'] = extract_gpu_info('product')
+                gpu_info['architecture'] = parse_product_arch()
+                gpu_info['vendor'] = extract_gpu_info('vendor')
+                gpu_info['physicalid'] = extract_gpu_info('physical id')
+
+                return gpu_info
+
+        # Parse the information for all the devices listed with lshw
+        devices = text.split('display')[1:]
+        gpu_infos = [lshw_single_gpu_info(device) for device in devices]
+        return filter_real_gpus(gpu_infos)
+
+    def lspci_gpu_info(text):
+        # Note: due to the single line descriptive format of lspci, 'vendor'
+        #   and 'physicalid' elements cannot be reliably extracted so are left None
+
+        # Separate the output into lines for processing
+        lines = text.replace('\\n', '\n')
+        lines = lines.splitlines()
+
+        gpu_infos = []
+        for line in lines:
+            # Graphics cards are listed as VGA or 3D controllers in lspci
+            if 'VGA' in line or '3D' in line:
+                gpu_info = {}
+                # Lines produced by lspci command are of the form:
+                #   xxxx:xx:xx.x Device Type: Name
+                #   eg:
+                #   0001:00:00.0 3D controller: NVIDIA Corp... [Tesla K80] (rev a1)
+                name_match = re.match(
+                    r'\d\d\d\d:\d\d:\d\d\.\d [\w\s]+: ([\w\s\(\)\[\]]*)', line
+                )
+                if name_match:
+                    gpu_info['product'] = name_match.group(1)
+                    arch_match = re.search(r'\[([\w\s]+)\]', line)
+                    if arch_match:
+                        gpu_info['architecture'] = arch_match.group(1)
+                    else:
+                        gpu_info['architecture'] = 'unspecified'
+                else:
+                    continue
+
+                gpu_infos.append(gpu_info)
+        return filter_real_gpus(gpu_infos)
+
+    # Run homogeneity checks on a list of GPU, return GPU with count if homogeneous,
+    #   otherwise None
+    def homogenise_gpus(gpus):
+        if gpu_infos == []:
+            warning('No graphics cards detected')
+            return None
+
+        if all_equal(gpu_infos):
+            gpu_infos[0]['ncards'] = len(gpu_infos)
+            return gpu_infos[0]
+
+        warning('Different models of graphics cards detected')
+
+        return None
+
+    # Obtain textual gpu info and delegate parsing to helper functions
+
+    try:
+        # First try is with detailed command lshw
+        info_cmd = ['lshw', '-C', 'video']
+        proc = Popen(info_cmd, stdout=PIPE, stderr=DEVNULL)
+        raw_info = str(proc.stdout.read())
+
+        gpu_infos = lshw_gpu_info(raw_info)
+        return homogenise_gpus(gpu_infos)
+
+    except OSError:
+        pass
+
+    try:
+        # Second try is with lspci, which is more readable and less detailed than lshw
+        info_cmd = ['lspci']
+        proc = Popen(info_cmd, stdout=PIPE, stderr=DEVNULL)
+        raw_info = str(proc.stdout.read())
+
+        # Parse the information for all the devices listed with lspci
+        gpu_infos = lspci_gpu_info(raw_info)
+        return homogenise_gpus(gpu_infos)
+
+    except OSError:
+        pass
+
+    return None
+
+
+@memoized_func
 def lscpu():
     try:
         p1 = Popen(['lscpu'], stdout=PIPE, stderr=PIPE)
@@ -172,6 +303,8 @@ def get_platform():
             return platform_registry['power8']
         elif 'arm' in brand:
             return platform_registry['arm']
+        elif 'amd' in brand:
+            return platform_registry['amd']
     except:
         pass
 
@@ -189,6 +322,10 @@ class Platform(object):
         self.cores_logical = kwargs.get('cores_logical', cpu_info['logical'])
         self.cores_physical = kwargs.get('cores_physical', cpu_info['physical'])
         self.isa = kwargs.get('isa', self._detect_isa())
+
+    @classmethod
+    def _mro(cls):
+        return [Platform]
 
     def __call__(self):
         return self
@@ -222,6 +359,17 @@ class Cpu64(Platform):
     # The known ISAs will be overwritten in the specialized classes
     known_isas = ()
 
+    @classmethod
+    def _mro(cls):
+        # Retain only the CPU Platforms
+        retval = []
+        for i in cls.mro():
+            if issubclass(i, Cpu64):
+                retval.append(i)
+            else:
+                break
+        return retval
+
     def _detect_isa(self):
         for i in reversed(self.known_isas):
             if any(j.startswith(i) for j in get_cpu_info()['flags']):
@@ -241,6 +389,11 @@ class Arm(Cpu64):
     known_isas = ('fp', 'asimd', 'asimdrdm')
 
 
+class Amd(Cpu64):
+
+    known_isas = ('cpp', 'sse', 'avx', 'avx2')
+
+
 class Power(Cpu64):
 
     def _detect_isa(self):
@@ -255,6 +408,60 @@ class Device(Platform):
         self.cores_logical = cores_logical
         self.cores_physical = cores_physical
         self.isa = isa
+
+    @classmethod
+    def _mro(cls):
+        # Retain only the Device Platforms
+        retval = []
+        for i in cls.mro():
+            if issubclass(i, Device):
+                retval.append(i)
+            else:
+                break
+        return retval
+
+    @cached_property
+    def march(self):
+        return None
+
+
+class NvidiaDevice(Device):
+
+    @cached_property
+    def march(self):
+        info = get_gpu_info()
+        if info:
+            architecture = info['architecture']
+            if 'tesla' in architecture.lower():
+                return 'tesla'
+        return None
+
+
+class AmdDevice(Device):
+
+    @cached_property
+    def march(cls):
+        # TODO: this corresponds to Vega, which acts as the fallback `march`
+        # in case we don't manage to detect the actual `march`. Can we improve this?
+        fallback = 'gfx900'
+
+        # The AMD's AOMP compiler toolkit ships the `mygpu` program to (quoting
+        # from the --help):
+        #
+        #     Print out the real gpu name for the current system
+        #     or for the codename specified with -getgpuname option.
+        #     mygpu will only print values accepted by cuda clang in
+        #     the clang argument --cuda-gpu-arch.
+        try:
+            p1 = Popen(['mygpu', '-d', 'gfx900'], stdout=PIPE, stderr=PIPE)
+        except OSError:
+            return fallback
+
+        output, _ = p1.communicate()
+        if output:
+            return output.decode("utf-8").strip()
+        else:
+            return fallback
 
 
 # CPUs
@@ -271,11 +478,13 @@ CLX = Intel64('clx')
 KNL = Intel64('knl')
 KNL7210 = Intel64('knl', cores_logical=256, cores_physical=64, isa='avx512')
 ARM = Arm('arm')
+AMD = Amd('amd')
 POWER8 = Power('power8')
 POWER9 = Power('power9')
 
 # Devices
-NVIDIAX = Device('nvidiax')
+NVIDIAX = NvidiaDevice('nvidiaX')
+AMDGPUX = AmdDevice('amdgpuX')
 
 
 platform_registry = {
@@ -290,10 +499,12 @@ platform_registry = {
     'clx': CLX,  # Coffee Lake
     'knl': KNL,
     'knl7210': KNL7210,
-    'arm': ARM,
+    'arm': ARM,  # Generic ARM CPU
+    'amd': AMD,  # Generic AMD CPU
     'power8': POWER8,
     'power9': POWER9,
-    'nvidiaX': NVIDIAX
+    'nvidiaX': NVIDIAX,  # Generic NVidia GPU
+    'amdgpuX': AMDGPUX   # Generic AMD GPU
 }
 """
 Registry dict for deriving Platform classes according to the environment variable

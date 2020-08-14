@@ -15,8 +15,7 @@ from devito.ir.support import IntervalGroup
 from devito.logger import warning
 from devito.mpi import MPI
 from devito.parameters import configuration
-from devito.symbolics import estimate_cost
-from devito.tools import flatten
+from devito.symbolics import subs_op_args
 from devito.types import CompositeObject
 
 __all__ = ['Timer', 'create_profile']
@@ -61,10 +60,10 @@ class Profiler(object):
             bundles = FindNodes(ExpressionBundle).visit(section)
 
             # Total operation count
-            ops = sum(i.ops for i in bundles)
+            ops = sum(i.ops*i.ispace.size for i in bundles)
 
             # Operation count at each section iteration
-            sops = sum(estimate_cost(i.expr) for i in flatten(b.exprs for b in bundles))
+            sops = sum(i.ops for i in bundles)
 
             # Total memory traffic
             mapper = {}
@@ -87,7 +86,7 @@ class Profiler(object):
             for i in bundles:
                 writes = {e.write for e in i.exprs
                           if e.is_tensor and e.write.is_TimeFunction}
-                points.append(reduce(mul, i.shape)*len(writes))
+                points.append(i.size*len(writes))
             points = sum(points)
 
             self._sections[section] = SectionData(ops, sops, points, traffic, itermaps)
@@ -184,16 +183,17 @@ class AdvancedProfiler(Profiler):
             time = max(getattr(args[self.name]._obj, name), 10e-7)
 
             # Number of FLOPs performed
-            ops = data.ops.subs(args)
+            ops = int(subs_op_args(data.ops, args))
 
             # Number of grid points computed
-            points = data.points.subs(args)
+            points = int(subs_op_args(data.points, args))
 
             # Compulsory traffic
-            traffic = float(data.traffic.subs(args)*dtype().itemsize)
+            traffic = float(subs_op_args(data.traffic, args)*dtype().itemsize)
 
             # Runtime itermaps/itershapes
-            itermaps = [OrderedDict([(k, v.subs(args)) for k, v in i.items()])
+            itermaps = [OrderedDict([(k, int(subs_op_args(v, args)))
+                                     for k, v in i.items()])
                         for i in data.itermaps]
             itershapes = tuple(tuple(i.values()) for i in itermaps)
 
@@ -365,7 +365,18 @@ class PerformanceSummary(OrderedDict):
         gpoints = float(points)/10**9
         gpointss = gpoints/time
 
-        self.globals['fdlike'] = PerfEntry(time, None, gpointss, None, None, None)
+        if self.input:
+            traffic = sum(v.traffic for v in self.input.values())
+            ops = sum(v.ops for v in self.input.values())
+
+            gflops = float(ops)/10**9
+            gflopss = gflops/time
+            oi = float(ops/traffic)
+        else:
+            gflopss = None
+            oi = None
+
+        self.globals['fdlike'] = PerfEntry(time, gflopss, gpointss, oi, None, None)
 
     @property
     def gflopss(self):
@@ -382,7 +393,7 @@ class PerformanceSummary(OrderedDict):
 
 def create_profile(name):
     """Create a new Profiler."""
-    if configuration['log-level'] == 'DEBUG':
+    if configuration['log-level'] in ['DEBUG', 'PERF']:
         # Enforce performance profiling in DEBUG mode
         level = 'advanced'
     else:

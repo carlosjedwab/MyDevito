@@ -12,8 +12,7 @@ import cgen as c
 from devito.data import FULL
 from devito.ir.equations import ClusterizedEq
 from devito.ir.support import (SEQUENTIAL, PARALLEL, PARALLEL_IF_ATOMIC, VECTORIZED,
-                               WRAPPABLE, ROUNDABLE, AFFINE, TILABLE, OVERLAPPABLE,
-                               Property, Forward, detect_io)
+                               AFFINE, Property, Forward, detect_io)
 from devito.symbolics import ListInitializer, FunctionFromPointer, as_symbol, ccode
 from devito.tools import (Signer, as_tuple, filter_ordered, filter_sorted, flatten,
                           validate_type, dtype_to_cstr)
@@ -22,8 +21,9 @@ from devito.types.basic import AbstractFunction
 
 __all__ = ['Node', 'Block', 'Expression', 'Element', 'Callable', 'Call', 'Conditional',
            'Iteration', 'List', 'LocalExpression', 'Section', 'TimedList', 'Prodder',
-           'MetaCall', 'ArrayCast', 'ForeignExpression', 'HaloSpot', 'IterationTree',
-           'ExpressionBundle', 'AugmentedExpression', 'Increment', 'Return', 'While']
+           'MetaCall', 'PointerCast', 'ForeignExpression', 'HaloSpot', 'IterationTree',
+           'ExpressionBundle', 'AugmentedExpression', 'Increment', 'Return', 'While',
+           'ParallelIteration', 'ParallelBlock', 'Dereference']
 
 # First-class IET nodes
 
@@ -44,11 +44,14 @@ class Node(Signer):
     is_ElementalFunction = False
     is_Call = False
     is_List = False
-    is_ArrayCast = False
+    is_PointerCast = False
+    is_Dereference = False
     is_Element = False
     is_Section = False
     is_HaloSpot = False
     is_ExpressionBundle = False
+    is_ParallelIteration = False
+    is_ParallelBlock = False
 
     _traversable = []
     """
@@ -73,7 +76,7 @@ class Node(Signer):
         handle.update(kwargs)
         return type(self)(**handle)
 
-    @property
+    @cached_property
     def ccode(self):
         """
         Generate C code.
@@ -161,9 +164,22 @@ class List(Node):
     _traversable = ['body']
 
     def __init__(self, header=None, body=None, footer=None):
-        self.header = as_tuple(header)
-        self.body = as_tuple(body)
-        self.footer = as_tuple(footer)
+        body = as_tuple(body)
+        if len(body) == 1 and all(type(i) == List for i in [self, body[0]]):
+            # De-nest Lists
+            #
+            # Note: to avoid disgusting metaclass voodoo (due to
+            # https://stackoverflow.com/questions/56514586/\
+            #     arguments-of-new-and-init-for-metaclasses)
+            # we change the internal state here in __init__
+            # rather than in __new__
+            self._args['header'] = self.header = as_tuple(header) + body[0].header
+            self._args['body'] = self.body = body[0].body
+            self._args['footer'] = self.footer = as_tuple(footer) + body[0].footer
+        else:
+            self.header = as_tuple(header)
+            self.body = as_tuple(body)
+            self.footer = as_tuple(footer)
 
     def __repr__(self):
         return "<%s (%d, %d, %d)>" % (self.__class__.__name__, len(self.header),
@@ -187,6 +203,11 @@ class Block(List):
     """A sequence of Nodes, wrapped in a block {...}."""
 
     is_Block = True
+
+    def __init__(self, header=None, body=None, footer=None):
+        self.header = as_tuple(header)
+        self.body = as_tuple(body)
+        self.footer = as_tuple(footer)
 
 
 class Element(Node):
@@ -258,9 +279,6 @@ class Expression(ExprStmt, Node):
     def __expr_finalize__(self, expr):
         """Finalize the Expression initialization."""
         self._expr = expr
-        self._reads, _ = detect_io(expr, relax=True)
-        self._dimensions = flatten(i.indices for i in self.functions if i.is_Indexed)
-        self._dimensions = tuple(filter_ordered(self._dimensions))
 
     def __repr__(self):
         return "<%s::%s>" % (self.__class__.__name__,
@@ -279,19 +297,20 @@ class Expression(ExprStmt, Node):
         """The Symbol/Indexed this Expression writes to."""
         return self.expr.lhs
 
-    @property
+    @cached_property
     def reads(self):
         """The Functions read by the Expression."""
-        return self._reads
+        return detect_io(self.expr, relax=True)[0]
 
     @property
     def write(self):
         """The Function written by the Expression."""
         return self.expr.lhs.function
 
-    @property
+    @cached_property
     def dimensions(self):
-        return self._dimensions
+        retval = flatten(i.indices for i in self.functions if i.is_Indexed)
+        return tuple(filter_ordered(retval))
 
     @property
     def is_scalar(self):
@@ -321,7 +340,7 @@ class Expression(ExprStmt, Node):
 
     @cached_property
     def functions(self):
-        functions = list(self._reads)
+        functions = list(self.reads)
         if self.write is not None:
             functions.append(self.write)
         return tuple(filter_ordered(functions))
@@ -361,9 +380,6 @@ class Iteration(Node):
         If an expression, it represents the for-loop max point; in this case, the
         min point is 0 and the step increment is unitary. If a 3-tuple, the
         format is ``(min point, max point, stepping)``.
-    offsets : 2-tuple of ints, optional
-        Additional offsets ``(min_ofs, max_ofs)`` to be honoured by the for-loop.
-        Defaults to (0, 0).
     direction: IterationDirection, optional
         The for-loop direction. Accepted:
         - ``Forward``: i += stepping (defaults)
@@ -382,8 +398,8 @@ class Iteration(Node):
 
     _traversable = ['nodes']
 
-    def __init__(self, nodes, dimension, limits, offsets=None, direction=None,
-                 properties=None, pragmas=None, uindices=None):
+    def __init__(self, nodes, dimension, limits, direction=None, properties=None,
+                 pragmas=None, uindices=None):
         self.nodes = as_tuple(nodes)
         self.dim = dimension
         self.index = self.dim.name
@@ -397,10 +413,6 @@ class Iteration(Node):
             self.limits = (self.dim.symbolic_min, limits, self.dim.step)
         else:
             self.limits = (0, limits, 1)
-
-        # Record offsets to later adjust loop limits accordingly
-        self.offsets = (0, 0) if offsets is None else as_tuple(offsets)
-        assert len(self.offsets) == 2
 
         # Track this Iteration's properties, pragmas and unbounded indices
         properties = as_tuple(properties)
@@ -445,18 +457,6 @@ class Iteration(Node):
         return VECTORIZED in self.properties
 
     @property
-    def is_Wrappable(self):
-        return WRAPPABLE in self.properties
-
-    @property
-    def is_Tilable(self):
-        return TILABLE in self.properties
-
-    @property
-    def is_Roundable(self):
-        return ROUNDABLE in self.properties
-
-    @property
     def ncollapsed(self):
         for i in self.properties:
             if i.name == 'collapsed':
@@ -478,7 +478,7 @@ class Iteration(Node):
         except TypeError:
             # A symbolic expression
             pass
-        return (_min + self.offsets[0], _max + self.offsets[1])
+        return (_min, _max)
 
     @property
     def symbolic_size(self):
@@ -502,9 +502,6 @@ class Iteration(Node):
         """
         _min = _min if _min is not None else self.limits[0]
         _max = _max if _max is not None else self.limits[1]
-
-        _min = _min + self.offsets[0]
-        _max = _max + self.offsets[1]
 
         return (_min, _max)
 
@@ -703,24 +700,26 @@ class TimedList(List):
         return (self.timer,)
 
 
-class ArrayCast(Node):
+class PointerCast(Node):
 
     """
     A node encapsulating a cast of a raw C pointer to a multi-dimensional array.
     """
 
-    is_ArrayCast = True
+    is_PointerCast = True
 
     def __init__(self, function):
         self.function = function
 
     def __repr__(self):
-        return "<ArrayCast(%s)>" % self.function
+        return "<PointerCast(%s)>" % self.function
 
     @property
     def castshape(self):
-        """The shape used in the left-hand side and right-hand side of the ArrayCast."""
-        if self.function.is_Array:
+        """
+        The shape used in the left-hand side and right-hand side of the PointerCast.
+        """
+        if self.function.is_ArrayBasic:
             return self.function.symbolic_shape[1:]
         else:
             return tuple(self.function._C_get_field(FULL, d).size
@@ -733,11 +732,11 @@ class ArrayCast(Node):
     @property
     def free_symbols(self):
         """
-        The symbols required by the ArrayCast.
+        The symbols required by the PointerCast.
 
         This may include DiscreteFunctions as well as Dimensions.
         """
-        if self.function.is_Array:
+        if self.function.is_ArrayBasic:
             sizes = flatten(s.free_symbols for s in self.function.symbolic_shape[1:])
             return (self.function, ) + as_tuple(sizes)
         else:
@@ -746,6 +745,41 @@ class ArrayCast(Node):
     @property
     def defines(self):
         return ()
+
+
+class Dereference(ExprStmt, Node):
+
+    """
+    A node encapsulating a dereference from a PointerArray to an Array.
+    """
+
+    is_Dereference = True
+
+    def __init__(self, array, parray):
+        self.array = array
+        self.parray = parray
+
+    def __repr__(self):
+        return "<Dereference(%s,%s)>" % (self.array, self.parray)
+
+    @property
+    def functions(self):
+        return (self.array, self.parray)
+
+    @property
+    def free_symbols(self):
+        """
+        The symbols required by the PointerCast.
+
+        This may include DiscreteFunctions as well as Dimensions.
+        """
+        return ((self.array, self.parray) +
+                tuple(flatten(i.free_symbols for i in self.array.symbolic_shape[1:])) +
+                tuple(self.parray.free_symbols))
+
+    @property
+    def defines(self):
+        return (self.array,)
 
 
 class LocalExpression(Expression):
@@ -812,7 +846,7 @@ class Section(List):
     computation unit).
     """
 
-    is_Sequence = True
+    is_Section = True
 
     def __init__(self, name, body=None):
         super(Section, self).__init__(body=body)
@@ -848,8 +882,8 @@ class ExpressionBundle(List):
         return self.body
 
     @property
-    def shape(self):
-        return tuple(self.ispace.dimension_map.values())
+    def size(self):
+        return self.ispace.size
 
 
 class Prodder(Call):
@@ -880,6 +914,24 @@ class Prodder(Call):
         return self._periodic
 
 
+class ParallelIteration(Iteration):
+
+    """
+    Implement a parallel for-loop.
+    """
+
+    is_ParallelIteration = True
+
+
+class ParallelBlock(Block):
+
+    """
+    A sequence of Nodes, wrapped in a parallel block {...}.
+    """
+
+    is_ParallelBlock = True
+
+
 Return = lambda i='': Element(c.Statement('return%s' % ((' %s' % i) if i else i)))
 
 
@@ -897,7 +949,7 @@ class HaloSpot(Node):
 
     _traversable = ['body']
 
-    def __init__(self, halo_scheme, body=None, properties=None):
+    def __init__(self, halo_scheme, body=None):
         super(HaloSpot, self).__init__()
         self._halo_scheme = halo_scheme
         if isinstance(body, Node):
@@ -908,14 +960,10 @@ class HaloSpot(Node):
             self._body = List()
         else:
             raise ValueError("`body` is expected to be a single Node")
-        self._properties = as_tuple(properties)
 
     def __repr__(self):
-        properties = ""
-        if self.properties:
-            properties = "[%s]" % ','.join(str(i) for i in self.properties)
         functions = "(%s)" % ",".join(i.name for i in self.functions)
-        return "<%s%s%s>" % (self.__class__.__name__, functions, properties)
+        return "<%s%s>" % (self.__class__.__name__, functions)
 
     @property
     def halo_scheme(self):
@@ -944,28 +992,6 @@ class HaloSpot(Node):
     @property
     def body(self):
         return self._body
-
-    @property
-    def properties(self):
-        return self._properties
-
-    @property
-    def hoistable(self):
-        for i in self.properties:
-            if i.name == 'hoistable':
-                return i.val
-        return ()
-
-    @property
-    def useless(self):
-        for i in self.properties:
-            if i.name == 'useless':
-                return i.val
-        return ()
-
-    @property
-    def is_Overlappable(self):
-        return OVERLAPPABLE in self.properties
 
     @property
     def functions(self):

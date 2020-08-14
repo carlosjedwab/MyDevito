@@ -133,7 +133,7 @@ class TensorFunction(AbstractTensor, Differentiable):
 
             def entry(i):
                 return sum(self[i, k]*other[k] for k in range(self.cols))
-            comps = [entry(i) for i in range(self.cols)]
+            comps = [entry(i) for i in range(self.rows)]
             func = vec_func(self, other)
             name = "%s%s" % (self.name, other.name)
             to = getattr(self, 'time_order', 0)
@@ -145,8 +145,9 @@ class TensorFunction(AbstractTensor, Differentiable):
 
             def entry(i, j):
                 return sum(self[i, k]*other[k, j] for k in range(self.cols))
-            comps = [[entry(i, j) for i in range(self.cols)]
-                     for j in range(self.rows)]
+            comps = [[entry(i, j) for j in range(self.cols)]
+                     for i in range(self.rows)]
+
             func = tens_func(self, other)
             name = "%s%s" % (self.name, other.name)
             to = getattr(self, 'time_order', 0)
@@ -372,6 +373,7 @@ class TensorTimeFunction(TensorFunction):
     @classmethod
     def __indices_setup__(cls, **kwargs):
         return TimeFunction.__indices_setup__(grid=kwargs.get('grid'),
+                                              save=kwargs.get('save'),
                                               dimensions=kwargs.get('dimensions'))
 
     @property
@@ -388,7 +390,7 @@ class TensorTimeFunction(TensorFunction):
         i = int(self.time_order / 2) if self.time_order >= 2 else 1
         _t = self.indices[self._time_position]
 
-        return self.subs(_t, _t + i * _t.spacing)
+        return self.subs({_t: _t + i * _t.spacing})
 
     @property
     def backward(self):
@@ -396,7 +398,7 @@ class TensorTimeFunction(TensorFunction):
         i = int(self.time_order / 2) if self.time_order >= 2 else 1
         _t = self.indices[self._time_position]
 
-        return self.subs(_t, _t - i * _t.spacing)
+        return self.subs({_t: _t - i * _t.spacing})
 
 
 class VectorFunction(TensorFunction):

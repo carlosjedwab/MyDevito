@@ -3,12 +3,12 @@ from itertools import product
 from operator import attrgetter
 
 from cached_property import cached_property
-from frozendict import frozendict
 from sympy import Max, Min
 
 from devito.data import CORE, OWNED, LEFT, CENTER, RIGHT
 from devito.ir.support import Scope
-from devito.tools import Tag, as_mapper, as_tuple, filter_ordered, flatten
+from devito.tools import (Tag, as_mapper, as_tuple, filter_ordered, flatten,
+                          frozendict, is_integer)
 
 __all__ = ['HaloScheme', 'HaloSchemeEntry', 'HaloSchemeException']
 
@@ -77,13 +77,15 @@ class HaloScheme(object):
         # Track the IterationSpace offsets induced by SubDomains/SubDimensions.
         # These should be honored in the derivation of the `omapper`
         self._honored = {}
-        for i in ispace.intervals:
-            if not i.dim._defines & set(self.dimensions):
-                continue
-            elif i.dim.is_Sub and not i.dim.local:
-                ltk, _ = i.dim.thickness.left
-                rtk, _ = i.dim.thickness.right
-                self._honored[i.dim.root] = frozenset([(ltk, rtk)])
+        # SubDimensions are not necessarily included directly in
+        # ispace.dimensions and hence we need to first utilize the `_defines` method
+        dims = set().union(*[d._defines for d in ispace.dimensions
+                             if d._defines & self.dimensions])
+        subdims = [d for d in dims if d.is_Sub and not d.local]
+        for i in subdims:
+            ltk, _ = i.thickness.left
+            rtk, _ = i.thickness.right
+            self._honored[i.root] = frozenset([(ltk, rtk)])
         self._honored = frozendict(self._honored)
 
     def __repr__(self):
@@ -431,7 +433,8 @@ def compute_local_indices(f, dims, ispace, scope):
         except KeyError:
             raise HaloSchemeException("Don't know how to build a HaloScheme as `%s` "
                                       "doesn't appear in `%s`" % (d, ispace))
-        loc_index = func([i[d] for i in scope.getreads(f)], key=lambda i: i-d)
+        candidates = [i[d] for i in scope.getreads(f) if not is_integer(i[d])]
+        loc_index = func(candidates, key=lambda i: i-d)
         if d.is_Stepping:
             subiters = ispace.sub_iterators.get(d.root, [])
             submap = as_mapper(subiters, lambda md: md.modulo)

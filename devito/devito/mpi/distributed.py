@@ -160,14 +160,14 @@ class AbstractDistributor(ABC):
 class Distributor(AbstractDistributor):
 
     """
-    Decompose a set of Dimensions over a set of MPI processes.
+    Decompose a domain over a set of MPI processes.
 
     Parameters
     ----------
     shape : tuple of ints
         The shape of the domain to be decomposed.
     dimensions : tuple of Dimensions
-        The decomposed Dimensions.
+        The domain Dimensions.
     comm : MPI communicator, optional
         The set of processes over which the domain is distributed. Defaults to
         MPI.COMM_WORLD.
@@ -246,6 +246,12 @@ class Distributor(AbstractDistributor):
         return self._topology
 
     @cached_property
+    def is_boundary_rank(self):
+        """ MPI rank interfaces with the boundary of the domain. """
+        return any([True if i == 0 or i == j-1 else False for i, j in
+                   zip(self.mycoords, self.topology)])
+
+    @cached_property
     def all_coords(self):
         """
         The coordinates of each MPI rank in the decomposed domain, ordered
@@ -298,14 +304,14 @@ class Distributor(AbstractDistributor):
             The index, or list of indices, for which the owning MPI rank(s) is
             retrieved.
         """
-        if isinstance(index, (tuple, list)):
-            if len(index) == 0:
-                return None
-            elif is_integer(index[0]):
-                # `index` is a single point
-                indices = [index]
-            else:
-                indices = index
+        assert isinstance(index, (tuple, list))
+        if len(index) == 0:
+            return None
+        elif is_integer(index[0]):
+            # `index` is a single point
+            indices = [index]
+        else:
+            indices = index
         ret = []
         for i in indices:
             assert len(i) == self.ndim
@@ -316,7 +322,7 @@ class Distributor(AbstractDistributor):
                     found = True
                     break
             assert found
-        return tuple(ret) if len(indices) > 1 else ret[0]
+        return as_tuple(ret)
 
     @property
     def neighborhood(self):

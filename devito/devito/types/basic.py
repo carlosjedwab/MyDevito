@@ -2,7 +2,6 @@ import abc
 from collections import namedtuple
 from ctypes import POINTER, Structure, byref
 from functools import reduce
-from math import ceil
 from operator import mul
 
 import numpy as np
@@ -10,18 +9,17 @@ import sympy
 from sympy.core.assumptions import _assume_rules
 from cached_property import cached_property
 from cgen import Struct, Value
-from frozendict import frozendict
 
 from devito.data import default_allocator
-from devito.parameters import configuration
-from devito.symbolics import Add
-from devito.tools import (EnrichedTuple, Evaluable, Pickable,
-                          ctypes_to_cstr, dtype_to_cstr, dtype_to_ctype)
+from devito.finite_differences import Evaluable
+from devito.symbolics import aligned_indices
+from devito.tools import (Pickable, ctypes_to_cstr, dtype_to_cstr, dtype_to_ctype,
+                          frozendict, memoized_meth)
 from devito.types.args import ArgProvider
 from devito.types.caching import Cached
+from devito.types.utils import DimensionTuple
 
-__all__ = ['Symbol', 'Scalar', 'Array', 'Indexed', 'Object',
-           'LocalObject', 'CompositeObject']
+__all__ = ['Symbol', 'Scalar', 'Indexed', 'Object', 'LocalObject', 'CompositeObject']
 
 
 Size = namedtuple('Size', 'left right')
@@ -67,15 +65,19 @@ class Basic(object):
 
     # Symbolic objects created internally by Devito
     is_Symbol = False
+    is_ArrayBasic = False
     is_Array = False
+    is_PointerArray = False
     is_Object = False
     is_LocalObject = False
 
     # Created by the user
     is_Input = False
+
     # Scalar symbolic objects created by the user
     is_Dimension = False
     is_Constant = False
+
     # Tensor symbolic objects created by the user
     is_DiscreteFunction = False
     is_Function = False
@@ -193,6 +195,11 @@ class AbstractSymbol(sympy.Symbol, Basic, Pickable, Evaluable):
 
     is_AbstractSymbol = True
     is_Symbol = True
+
+    # SymPy default assumptions
+    is_real = True
+    is_imaginary = False
+    is_commutative = True
 
     @classmethod
     def _filter_assumptions(cls, **kwargs):
@@ -381,7 +388,6 @@ class DataSymbol(AbstractSymbol, Cached):
 
     @classmethod
     def _cache_key(cls, *args, **kwargs):
-        """A DataSymbol caches on the class type itself."""
         return cls
 
     def __new__(cls, *args, **kwargs):
@@ -482,7 +488,6 @@ class AbstractTensor(sympy.ImmutableDenseMatrix, Basic, Cached, Pickable, Evalua
 
     @classmethod
     def _cache_key(cls, *args, **kwargs):
-        """An AbstractTensor caches on the class type itself."""
         return cls
 
     def __new__(cls, *args, **kwargs):
@@ -497,7 +502,6 @@ class AbstractTensor(sympy.ImmutableDenseMatrix, Basic, Cached, Pickable, Evalua
             return newobj
 
         name = kwargs.get('name')
-        # Number of dimensions
         indices, _ = cls.__indices_setup__(**kwargs)
 
         # Create new, unique type instance from cls and the symbol name
@@ -514,6 +518,7 @@ class AbstractTensor(sympy.ImmutableDenseMatrix, Basic, Cached, Pickable, Evalua
 
         # Store new instance in symbol cache
         Cached.__init__(newobj, newcls)
+
         return newobj
 
     __hash__ = Cached.__hash__
@@ -580,7 +585,7 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
 
     There are five relevant AbstractFunction sub-types: ::
 
-        * Array: A function that does not carry data. Usually created by the DSE.
+        * Array: A function that does not carry data.
         * Function: A space-varying discrete function, which carries user data.
         * TimeFunction: A time- and space-varying discrete function, which carries
                         user data.
@@ -599,21 +604,34 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
 
     is_AbstractFunction = True
 
+    # SymPy default assumptions
+    is_real = True
+    is_imaginary = False
+    is_commutative = True
+
     @classmethod
     def _cache_key(cls, *args, **kwargs):
-        """An AbstractFunction caches on the class type itself."""
-        return cls
+        return cls, args
 
     def __new__(cls, *args, **kwargs):
-        options = kwargs.get('options', {})
+        options = kwargs.get('options', {'evaluate': False})
 
+        # Is the object already in cache (e.g., f(x), f(x+1)) ?
         key = cls._cache_key(*args, **kwargs)
         obj = cls._cache_get(key)
+        if obj is not None:
+            return obj
 
+        # Does the base object exist at least (e.g. f(x))?
+        obj = cls._cache_get(cls)
         if obj is not None:
             newobj = sympy.Function.__new__(cls, *args, **options)
-            newobj.__init_cached__(key)
+            newobj.__init_cached__(cls)
+            Cached.__init__(newobj, key)
             return newobj
+
+        # Preprocess arguments
+        args, kwargs = cls.__args_setup__(*args, **kwargs)
 
         # Not in cache. Create a new Function via sympy.Function
         name = kwargs.get('name')
@@ -639,7 +657,9 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
         newobj.function = newobj
 
         # Store new instance in symbol cache
-        Cached.__init__(newobj, newcls)
+        key = (newcls, indices)
+        Cached.__init__(newobj, key, newcls)
+
         return newobj
 
     def __init__(self, *args, **kwargs):
@@ -653,6 +673,17 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
         self._padding = self.__padding_setup__(**kwargs)
 
     __hash__ = Cached.__hash__
+
+    @classmethod
+    def __args_setup__(cls, *args, **kwargs):
+        """
+        Preprocess *args and **kwargs before object initialization.
+
+        Notes
+        -----
+        This stub is invoked only if a look up in the cache fails.
+        """
+        return args, kwargs
 
     @classmethod
     def __indices_setup__(cls, **kwargs):
@@ -698,7 +729,7 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
     @property
     def indices_ref(self):
         """The reference indices of the object (indices at first creation)."""
-        return EnrichedTuple(*self.function.indices, getters=self.dimensions)
+        return DimensionTuple(*self.function.indices, getters=self.dimensions)
 
     @property
     def origin(self):
@@ -715,8 +746,32 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
         return self._dimensions
 
     @property
+    def _eval_deriv(self):
+        return self
+
+    @property
+    def _is_on_grid(self):
+        """
+        Check whether the object is on the grid and requires averaging.
+        For example, if the original non-staggered function is f(x)
+        then f(x) is on the grid and f(x + h_x/2) is off the grid.
+        """
+        return self._check_indices(inds=self.indices)
+
+    @memoized_meth
+    def _check_indices(self, inds=None):
+        """
+        Check if the function indices are aligned with the dimensions.
+        """
+        inds = inds or self.indices
+        return all([aligned_indices(i, j, d.spacing) for i, j, d in
+                    zip(inds, self.indices_ref, self.dimensions)])
+
+    @property
     def evaluate(self):
         # Average values if at a location not on the Function's grid
+        if self._is_on_grid:
+            return self
         weight = 1.0
         avg_list = [self]
         is_averaged = False
@@ -727,8 +782,8 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
             else:
                 weight *= 1/2
                 is_averaged = True
-                avg_list = [a.subs({i: i - d.spacing/2}) + a.subs({i: i + d.spacing/2})
-                            for a in avg_list]
+                avg_list = [(a.xreplace({i: i - d.spacing/2}) +
+                             a.xreplace({i: i + d.spacing/2})) for a in avg_list]
 
         if not is_averaged:
             return self
@@ -756,13 +811,14 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
         padding regions. While halo and padding are known quantities (integers),
         the domain size is given as a symbol.
         """
-        halo = [Add(*i) for i in self._size_halo]
-        padding = [Add(*i) for i in self._size_padding]
+        halo = [sympy.Add(*i, evaluate=False) for i in self._size_halo]
+        padding = [sympy.Add(*i, evaluate=False) for i in self._size_padding]
         domain = [i.symbolic_size for i in self.dimensions]
-        ret = tuple(Add(i, j, k) for i, j, k in zip(domain, halo, padding))
-        return EnrichedTuple(*ret, getters=self.dimensions)
+        ret = tuple(sympy.Add(i, j, k, evaluate=False)
+                    for i, j, k in zip(domain, halo, padding))
+        return DimensionTuple(*ret, getters=self.dimensions)
 
-    @property
+    @cached_property
     def indexed(self):
         """The wrapped IndexedData object."""
         return IndexedData(self.name, shape=self.shape, function=self.function)
@@ -809,10 +865,6 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
 
     @property
     def is_const(self):
-        """
-        True if the carried data values cannot be modified within an Operator,
-        False otherwise.
-        """
         return False
 
     @property
@@ -826,7 +878,7 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
     @cached_property
     def _size_domain(self):
         """Number of points in the domain region."""
-        return EnrichedTuple(*self.shape, getters=self.dimensions)
+        return DimensionTuple(*self.shape, getters=self.dimensions)
 
     @cached_property
     def _size_halo(self):
@@ -836,7 +888,7 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
 
         sizes = tuple(Size(i, j) for i, j in self._halo)
 
-        return EnrichedTuple(*sizes, getters=self.dimensions, left=left, right=right)
+        return DimensionTuple(*sizes, getters=self.dimensions, left=left, right=right)
 
     @cached_property
     def _size_owned(self):
@@ -846,7 +898,7 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
 
         sizes = tuple(Size(i.right, i.left) for i in self._size_halo)
 
-        return EnrichedTuple(*sizes, getters=self.dimensions, left=left, right=right)
+        return DimensionTuple(*sizes, getters=self.dimensions, left=left, right=right)
 
     @cached_property
     def _size_padding(self):
@@ -856,13 +908,13 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
 
         sizes = tuple(Size(i, j) for i, j in self._padding)
 
-        return EnrichedTuple(*sizes, getters=self.dimensions, left=left, right=right)
+        return DimensionTuple(*sizes, getters=self.dimensions, left=left, right=right)
 
     @cached_property
     def _size_nopad(self):
         """Number of points in the domain+halo region."""
         sizes = tuple(i+sum(j) for i, j in zip(self._size_domain, self._size_halo))
-        return EnrichedTuple(*sizes, getters=self.dimensions)
+        return DimensionTuple(*sizes, getters=self.dimensions)
 
     @cached_property
     def _size_nodomain(self):
@@ -872,13 +924,13 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
 
         sizes = tuple(Size(i, j) for i, j in np.add(self._halo, self._padding))
 
-        return EnrichedTuple(*sizes, getters=self.dimensions, left=left, right=right)
+        return DimensionTuple(*sizes, getters=self.dimensions, left=left, right=right)
 
     @cached_property
     def _offset_domain(self):
         """Number of points before the first domain element."""
         offsets = tuple(np.add(self._size_padding.left, self._size_halo.left))
-        return EnrichedTuple(*offsets, getters=self.dimensions)
+        return DimensionTuple(*offsets, getters=self.dimensions)
 
     @cached_property
     def _offset_halo(self):
@@ -888,7 +940,7 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
 
         offsets = tuple(Offset(i, j) for i, j in zip(left, right))
 
-        return EnrichedTuple(*offsets, getters=self.dimensions, left=left, right=right)
+        return DimensionTuple(*offsets, getters=self.dimensions, left=left, right=right)
 
     @cached_property
     def _offset_owned(self):
@@ -898,7 +950,7 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
 
         offsets = tuple(Offset(i, j) for i, j in zip(left, right))
 
-        return EnrichedTuple(*offsets, getters=self.dimensions, left=left, right=right)
+        return DimensionTuple(*offsets, getters=self.dimensions, left=left, right=right)
 
     @property
     def _data_alignment(self):
@@ -908,25 +960,23 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
         """
         return default_allocator().guaranteed_alignment
 
-    def indexify(self, indices=None):
+    def indexify(self, indices=None, lshift=False, subs=None):
         """Create a types.Indexed from the current object."""
         if indices is not None:
             return Indexed(self.indexed, *indices)
 
-        # Get spacing symbols for replacement
-        spacings = [i.spacing for i in self.dimensions]
+        # Substitution for each index (spacing only used in own dimension)
+        subs = subs or {}
+        subs = [{**{d.spacing: 1, -d.spacing: -1}, **subs} for d in self.dimensions]
 
-        # Only keep the ones used as indices.
-        spacings = [s for i, s in enumerate(spacings)
-                    if s.free_symbols.intersection(self.args[i].free_symbols)]
-
-        # Substitution for each index
-        subs = dict([(s, 1) for s in spacings])
-
+        # Add halo shift
+        shift = self._size_nodomain.left if lshift else tuple([0]*len(self.dimensions))
         # Indices after substitutions
-        indices = [(a - o).subs(subs) for a, o in zip(self.args, self.origin)]
-
-        return Indexed(self.indexed, *indices)
+        indices = [sympy.sympify((a - o + f).xreplace(s)) for a, o, f, s in
+                   zip(self.args, self.origin, shift, subs)]
+        indices = [i.xreplace({k: sympy.Integer(k) for k in i.atoms(sympy.Float)})
+                   for i in indices]
+        return self.indexed[indices]
 
     def __getitem__(self, index):
         """Shortcut for ``self.indexed[index]``."""
@@ -939,127 +989,6 @@ class AbstractFunction(sympy.Function, Basic, Cached, Pickable, Evaluable):
     @property
     def _pickle_reconstruct(self):
         return self.__class__.__base__
-
-
-class Array(AbstractFunction):
-    """
-    Tensor symbol representing an array in symbolic equations.
-
-    An Array is very similar to a sympy.Indexed, though it also carries
-    metadata essential for code generation.
-
-    Parameters
-    ----------
-    name : str
-        Name of the symbol.
-    dimensions : tuple of Dimension
-        Dimensions associated with the object.
-    dtype : data-type, optional
-        Any object that can be interpreted as a numpy data type. Defaults
-        to ``np.float32``.
-    halo : iterable of 2-tuples, optional
-        The halo region of the object.
-    padding : iterable of 2-tuples, optional
-        The padding region of the object.
-    scope : str, optional
-        Control memory allocation. Allowed values: 'heap', 'stack'. Defaults
-        to 'heap'.
-
-    Warnings
-    --------
-    Arrays are created and managed directly by Devito (IOW, they are not
-    expected to be used directly in user code).
-    """
-
-    is_Array = True
-    is_Tensor = True
-
-    def __new__(cls, *args, **kwargs):
-        kwargs.update({'options': {'evaluate': False}})
-        return AbstractFunction.__new__(cls, *args, **kwargs)
-
-    def __init_finalize__(self, *args, **kwargs):
-        super(Array, self).__init_finalize__(*args, **kwargs)
-
-        self._scope = kwargs.get('scope', 'heap')
-        assert self._scope in ['heap', 'stack']
-
-    def __padding_setup__(self, **kwargs):
-        padding = kwargs.get('padding')
-        if padding is None:
-            padding = [(0, 0) for _ in range(self.ndim)]
-            if kwargs.get('autopadding', configuration['autopadding']):
-                # Heuristic 1; Arrays are typically introduced for DSE-produced
-                # temporaries, and are almost always used together with loop
-                # blocking.  Since the typical block size is a multiple of the SIMD
-                # vector length, `vl`, padding is made such that the NODOMAIN size
-                # is a multiple of `vl` too
-
-                # Heuristic 2: the right-NODOMAIN size is not only a multiple of
-                # `vl`, but also guaranteed to be *at least* greater or equal than
-                # `vl`, so that the compiler can tweak loop trip counts to maximize
-                # the effectiveness of SIMD vectorization
-
-                # Let UB be a function that rounds up a value `x` to the nearest
-                # multiple of the SIMD vector length
-                vl = configuration['platform'].simd_items_per_reg(self.dtype)
-                ub = lambda x: int(ceil(x / vl)) * vl
-
-                fvd_halo_size = sum(self.halo[-1])
-                fvd_pad_size = (ub(fvd_halo_size) - fvd_halo_size) + vl
-
-                padding[-1] = (0, fvd_pad_size)
-            return tuple(padding)
-        elif isinstance(padding, int):
-            return tuple((0, padding) for _ in range(self.ndim))
-        elif isinstance(padding, tuple) and len(padding) == self.ndim:
-            return tuple((0, i) if isinstance(i, int) else i for i in padding)
-        else:
-            raise TypeError("`padding` must be int or %d-tuple of ints" % self.ndim)
-
-    @classmethod
-    def __indices_setup__(cls, **kwargs):
-        return tuple(kwargs['dimensions']), tuple(kwargs['dimensions'])
-
-    @classmethod
-    def __dtype_setup__(cls, **kwargs):
-        return kwargs.get('dtype', np.float32)
-
-    @property
-    def shape(self):
-        return self.symbolic_shape
-
-    @property
-    def scope(self):
-        return self._scope
-
-    @property
-    def _mem_stack(self):
-        return self._scope == 'stack'
-
-    @property
-    def _mem_heap(self):
-        return self._scope == 'heap'
-
-    @property
-    def _C_typename(self):
-        return ctypes_to_cstr(POINTER(dtype_to_ctype(self.dtype)))
-
-    @property
-    def free_symbols(self):
-        return super().free_symbols - {d for d in self.dimensions if d.is_Default}
-
-    def update(self, **kwargs):
-        self._shape = kwargs.get('shape', self.shape)
-        self._dimensions = kwargs.get('dimensions', self.dimensions)
-        self._dtype = kwargs.get('dtype', self.dtype)
-        self._halo = kwargs.get('halo', self._halo)
-        self._padding = kwargs.get('padding', self._padding)
-        self._scope = kwargs.get('scope', self._scope)
-        assert self._scope in ['heap', 'stack']
-
-    # Pickling support
-    _pickle_kwargs = AbstractFunction._pickle_kwargs + ['dimensions', 'scope']
 
 
 # Objects belonging to the Devito API not involving data, such as data structures
@@ -1248,7 +1177,7 @@ class IndexedData(sympy.IndexedBase, Pickable):
 class Indexed(sympy.Indexed):
 
     # The two type flags have changed in upstream sympy as of version 1.1,
-    # but the below interpretation is used throughout the DSE and DLE to
+    # but the below interpretation is used throughout the compiler to
     # identify Indexed objects. With the sympy-1.1 changes a new flag
     # obj.is_Indexed was introduced which should be preferred, but the
     # required changes are cumbersome and many...
@@ -1275,3 +1204,8 @@ class Indexed(sympy.Indexed):
     @property
     def origin(self):
         return self.function.origin
+
+    @cached_property
+    def free_symbols(self):
+        # Make it cached, since it's relatively expensive and called often
+        return super(Indexed, self).free_symbols

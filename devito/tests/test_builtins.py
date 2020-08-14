@@ -4,19 +4,20 @@ from scipy.ndimage import gaussian_filter
 from scipy import misc
 
 from conftest import skipif
-from devito import Grid, Function
-from devito.builtins import assign, gaussian_smooth, initialize_function
+from devito import Grid, Function, TimeFunction, switchconfig
+from devito.builtins import (assign, norm, gaussian_smooth, initialize_function,
+                             inner, mmin, mmax)
 from devito.data import LEFT, RIGHT
 from devito.tools import as_tuple
-from devito.types import SubDomain
-
-pytestmark = skipif(['yask', 'ops'])
+from devito.types import SubDomain, SparseTimeFunction
 
 
 class TestAssign(object):
+
     """
-    Class for testing the assign builtin
+    Class for testing the assign builtin.
     """
+
     def test_single_scalar(self):
         grid = Grid(shape=(4, 4))
 
@@ -102,9 +103,11 @@ class TestAssign(object):
 
 
 class TestGaussianSmooth(object):
+
     """
-    Class for testing the Gaussian smooth builtin
+    Class for testing the Gaussian smooth builtin.
     """
+
     @pytest.mark.parametrize('sigma', [1, 2, 3, 4, 5])
     def test_gs_1d_int(self, sigma):
         """Test the Gaussian smoother in 1d."""
@@ -151,7 +154,7 @@ class TestGaussianSmooth(object):
         assert np.amax(np.abs(sp_smoothed - np.array(dv_smoothed))) <= 1e-5
 
     @skipif('nompi')
-    @pytest.mark.parallel(mode=4)
+    @pytest.mark.parallel(mode=[(4, 'full')])
     def test_gs_parallel(self):
         a = np.arange(64).reshape((8, 8))
         grid = Grid(shape=a.shape)
@@ -175,9 +178,11 @@ class TestGaussianSmooth(object):
 
 
 class TestInitializeFunction(object):
+
     """
-    Class for testing the initialize function builtin
+    Class for testing the initialize function builtin.
     """
+
     def test_if_serial(self):
         """Test in serial."""
         a = np.arange(16).reshape((4, 4))
@@ -189,6 +194,18 @@ class TestInitializeFunction(object):
         assert np.all(a[:, ::-1] - np.array(f.data[4:8, 8:12]) == 0)
         assert np.all(a[::-1, :] - np.array(f.data[0:4, 4:8]) == 0)
         assert np.all(a[::-1, :] - np.array(f.data[8:12, 4:8]) == 0)
+
+    def test_if_serial_asymmetric(self):
+        """Test in serial with asymmetric padding."""
+        a = np.arange(35).reshape((7, 5))
+        grid = Grid(shape=(12, 12))
+        f = Function(name='f', grid=grid, dtype=np.int32)
+        initialize_function(f, a, ((2, 3), (4, 3)), mode='reflect')
+
+        assert np.all(a[:, -2::-1] - np.array(f.data[2:9, 0:4]) == 0)
+        assert np.all(a[:, :1:-1] - np.array(f.data[2:9, 9:12]) == 0)
+        assert np.all(a[1::-1, :] - np.array(f.data[0:2, 4:9]) == 0)
+        assert np.all(a[6:3:-1, :] - np.array(f.data[9:12, 4:9]) == 0)
 
     def test_nbl_zero(self):
         """Test for nbl = 0."""
@@ -221,3 +238,68 @@ class TestInitializeFunction(object):
         else:
             assert np.all(a[::-1, 3:6] - np.array(f.data[12:18, 9:12]) == 0)
             assert np.all(a[3:6, ::-1] - np.array(f.data[9:12, 12:18]) == 0)
+
+
+class TestBuiltinsResult(object):
+
+    """
+    Test the builtins
+    """
+
+    def test_serial_vs_parallel(self):
+        grid = Grid(shape=(100, 100))
+
+        f = TimeFunction(name='f', grid=grid)
+        f.data[:] = np.arange(10000).reshape((100, 100))
+
+        assert np.isclose(norm(f),
+                          switchconfig(openmp=True)(norm)(f),
+                          rtol=1e-5)
+
+    def test_inner_sparse(self):
+        """
+        Test that inner produces the correct result against numpy
+        """
+        grid = Grid((101, 101), extent=(1000., 1000.))
+
+        nrec = 101
+        rec0 = SparseTimeFunction(name='rec0', grid=grid, nt=1001, npoint=nrec)
+        rec1 = SparseTimeFunction(name='rec1', grid=grid, nt=1001, npoint=nrec)
+
+        rec0.data[:, :] = 1 + np.random.randn(*rec0.shape).astype(grid.dtype)
+        rec1.data[:, :] = 1 + np.random.randn(*rec1.shape).astype(grid.dtype)
+        term1 = inner(rec0, rec1)
+        term2 = np.inner(rec0.data.reshape(-1), rec1.data.reshape(-1))
+        assert np.isclose(term1/term2 - 1, 0.0, rtol=0.0, atol=1e-5)
+
+    def test_norm_sparse(self):
+        """
+        Test that norm produces the correct result against numpy
+        """
+        grid = Grid((101, 101), extent=(1000., 1000.))
+
+        nrec = 101
+        rec0 = SparseTimeFunction(name='rec0', grid=grid, nt=1001, npoint=nrec)
+
+        rec0.data[:, :] = 1 + np.random.rand(*rec0.shape).astype(grid.dtype)
+        term1 = np.linalg.norm(rec0.data)
+        term2 = norm(rec0)
+        assert np.isclose(term1/term2 - 1, 0.0, rtol=0.0, atol=1e-5)
+
+    def test_min_max_sparse(self):
+        """
+        Test that mmin/mmax work on SparseFunction
+        """
+        grid = Grid((101, 101), extent=(1000., 1000.))
+
+        nrec = 101
+        rec0 = SparseTimeFunction(name='rec0', grid=grid, nt=1001, npoint=nrec)
+
+        rec0.data[:, :] = 1 + np.random.randn(*rec0.shape).astype(grid.dtype)
+        term1 = np.min(rec0.data)
+        term2 = mmin(rec0)
+        assert np.isclose(term1/term2 - 1, 0.0, rtol=0.0, atol=1e-5)
+
+        term1 = np.max(rec0.data)
+        term2 = mmax(rec0)
+        assert np.isclose(term1/term2 - 1, 0.0, rtol=0.0, atol=1e-5)

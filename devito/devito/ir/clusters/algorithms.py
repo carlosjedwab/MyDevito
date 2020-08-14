@@ -1,16 +1,14 @@
-from collections import Counter
 from itertools import groupby
 
 import sympy
 
-from devito.ir.support import Any, Backward, Forward, IterationSpace, Scope
+from devito.ir.support import Any, Backward, Forward, IterationSpace
 from devito.ir.clusters.analysis import analyze
 from devito.ir.clusters.cluster import Cluster, ClusterGroup
-from devito.ir.clusters.queue import Queue
-from devito.symbolics import CondEq
-from devito.tools import DAG, as_tuple, flatten, timed_pass
+from devito.ir.clusters.queue import QueueStateful
+from devito.tools import timed_pass
 
-__all__ = ['clusterize', 'guard', 'Toposort']
+__all__ = ['clusterize']
 
 
 def clusterize(exprs):
@@ -20,13 +18,10 @@ def clusterize(exprs):
     # Initialization
     clusters = [Cluster(e, e.ispace, e.dspace) for e in exprs]
 
-    # Compute a topological ordering that honours flow- and anti-dependences
-    clusters = Toposort().process(clusters)
-
     # Setup the IterationSpaces based on data dependence analysis
     clusters = Schedule().process(clusters)
 
-    # Introduce conditional Clusters
+    # Handle ConditionalDimensions
     clusters = guard(clusters)
 
     # Determine relevant computational properties (e.g., parallelism)
@@ -35,131 +30,7 @@ def clusterize(exprs):
     return ClusterGroup(clusters)
 
 
-class Toposort(Queue):
-
-    """
-    Topologically sort a sequence of Clusters.
-
-    A heuristic, which attempts to maximize Cluster fusion by bringing together
-    Clusters with compatible IterationSpace, is used.
-    """
-
-    def callback(self, cgroups, prefix):
-        cgroups = self._toposort(cgroups, prefix)
-        cgroups = self._aggregate(cgroups, prefix)
-        return cgroups
-
-    def process(self, clusters):
-        cgroups = [ClusterGroup(c, c.itintervals) for c in clusters]
-        cgroups = self._process_fdta(cgroups, 1)
-        clusters = ClusterGroup.concatenate(*cgroups)
-        return clusters
-
-    def _toposort(self, cgroups, prefix):
-        # Are there any ClusterGroups that could potentially be fused? If not,
-        # don't waste time computing a new topological ordering
-        counter = Counter(cg.itintervals for cg in cgroups)
-        if not any(v > 1 for it, v in counter.most_common()):
-            return cgroups
-
-        # Similarly, if all ClusterGroups have the same exact prefix, no need
-        # to topologically resort
-        if len(counter.most_common()) == 1:
-            return cgroups
-
-        dag = self._build_dag(cgroups, prefix)
-
-        def choose_element(queue, scheduled):
-            # Heuristic 1: do not move Clusters computing Arrays (temporaries),
-            # to preserve cross-loop blocking opportunities
-            # Heuristic 2: prefer a node having same IterationSpace as that of
-            # the last scheduled node to maximize Cluster fusion
-            if not scheduled:
-                return queue.pop()
-            last = scheduled[-1]
-            for i in list(queue):
-                if any(f.is_Array for f in i.scope.writes):
-                    continue
-                elif i.itintervals == last.itintervals:
-                    queue.remove(i)
-                    return i
-            return queue.popleft()
-
-        processed = dag.topological_sort(choose_element)
-
-        return processed
-
-    def _aggregate(self, cgroups, prefix):
-        """
-        Concatenate a sequence of ClusterGroups into a new ClusterGroup.
-        """
-        return [ClusterGroup(cgroups, prefix)]
-
-    def _build_dag(self, cgroups, prefix):
-        """
-        A DAG captures data dependences between ClusterGroups up to the iteration
-        space depth dictated by ``prefix``.
-
-        Examples
-        --------
-        Consider two ClusterGroups `c0` and `c1`, and ``prefix=[i]``.
-
-        1) cg0 := b[i, j] = ...
-           cg1 := ... = ... b[i, j] ...
-           Non-carried flow-dependence, so `cg1` must go after `cg0`.
-
-        2) cg0 := b[i, j] = ...
-           cg1 := ... = ... b[i, j-1] ...
-           Carried flow-dependence in `j`, so `cg1` must go after `cg0`.
-
-        3) cg0 := b[i, j] = ...
-           cg1 := ... = ... b[i, j+1] ...
-           Carried anti-dependence in `j`, so `cg1` must go after `cg0`.
-
-        4) cg0 := b[i, j] = ...
-           cg1 := ... = ... b[i-1, j+1] ...
-           Carried flow-dependence in `i`, so `cg1` can safely go before or after
-           `cg0`. Note: the `j+1` in `cg1` has no impact -- the actual dependence
-           betweeb `b[i, j]` and `b[i-1, j+1]` is along `i`.
-        """
-        prefix = {i.dim for i in as_tuple(prefix)}
-
-        dag = DAG(nodes=cgroups)
-        for n, cg0 in enumerate(cgroups):
-            for cg1 in cgroups[n+1:]:
-                scope = Scope(exprs=cg0.exprs + cg1.exprs)
-
-                # Handle anti-dependences
-                deps = scope.d_anti - (cg0.scope.d_anti + cg1.scope.d_anti)
-                if any(i.cause & prefix for i in deps):
-                    # Anti-dependences break the execution flow
-                    # i) ClusterGroups between `cg0` and `cg1` must precede `cg1`
-                    for cg2 in cgroups[n:cgroups.index(cg1)]:
-                        dag.add_edge(cg2, cg1)
-                    # ii) ClusterGroups after `cg1` cannot precede `cg1`
-                    for cg2 in cgroups[cgroups.index(cg1)+1:]:
-                        dag.add_edge(cg1, cg2)
-                    break
-                elif deps:
-                    dag.add_edge(cg0, cg1)
-
-                # Flow-dependences along one of the `prefix` Dimensions can
-                # be ignored; all others require sequentialization
-                deps = scope.d_flow - (cg0.scope.d_flow + cg1.scope.d_flow)
-                if any(not (i.cause and i.cause & prefix) for i in deps):
-                    dag.add_edge(cg0, cg1)
-                    continue
-
-                # Handle increment-after-write dependences
-                deps = scope.d_output - (cg0.scope.d_output + cg1.scope.d_output)
-                if any(i.is_iaw for i in deps):
-                    dag.add_edge(cg0, cg1)
-                    continue
-
-        return dag
-
-
-class Schedule(Queue):
+class Schedule(QueueStateful):
 
     """
     This special Queue produces a new sequence of "scheduled" Clusters, which
@@ -202,7 +73,7 @@ class Schedule(Queue):
           Dimension in both Clusters.
     """
 
-    @timed_pass(name='lowering.Clusters.Schedule')
+    @timed_pass(name='schedule')
     def process(self, clusters):
         return self._process_fdta(clusters, 1)
 
@@ -217,7 +88,7 @@ class Schedule(Queue):
         # `clusters` are supposed to share it
         candidates = prefix[-1].dim._defines
 
-        scope = Scope(exprs=flatten(c.exprs for c in clusters))
+        scope = self._fetch_scope(clusters)
 
         # Handle the nastiest case -- ambiguity due to the presence of both a
         # flow- and an anti-dependence.
@@ -284,6 +155,7 @@ class Schedule(Queue):
         return test
 
 
+@timed_pass()
 def guard(clusters):
     """
     Split Clusters containing conditional expressions into separate Clusters.
@@ -291,20 +163,26 @@ def guard(clusters):
     processed = []
     for c in clusters:
         # Group together consecutive expressions with same ConditionalDimensions
-        for cds, g in groupby(c.exprs, key=lambda e: e.conditionals):
+        for cds, g in groupby(c.exprs, key=lambda e: tuple(e.conditionals)):
+            exprs = list(g)
+
             if not cds:
-                processed.append(c.rebuild(exprs=list(g)))
+                processed.append(c.rebuild(exprs=exprs))
                 continue
 
-            # Create a guarded Cluster
+            # Chain together all conditions from all expressions in `c`
             guards = {}
             for cd in cds:
                 condition = guards.setdefault(cd.parent, [])
-                if cd.condition is None:
-                    condition.append(CondEq(cd.parent % cd.factor, 0))
-                else:
-                    condition.append(cd.condition)
-            guards = {k: sympy.And(*v, evaluate=False) for k, v in guards.items()}
-            processed.append(c.rebuild(exprs=list(g), guards=guards))
+                for e in exprs:
+                    try:
+                        condition.append(e.conditionals[cd])
+                        break
+                    except KeyError:
+                        pass
+            guards = {d: sympy.And(*v, evaluate=False) for d, v in guards.items()}
+
+            # Construct a guarded Cluster
+            processed.append(c.rebuild(exprs=exprs, guards=guards))
 
     return ClusterGroup(processed)

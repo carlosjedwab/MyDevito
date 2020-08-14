@@ -1,19 +1,19 @@
 from collections import OrderedDict
 
 from devito.ir import DummyEq, Cluster, Scope
-from devito.passes.clusters.utils import dse_pass, makeit_ssa
-from devito.symbolics import count, estimate_cost, q_xop, q_leaf, yreplace
+from devito.passes.clusters.utils import cluster_pass, makeit_ssa
+from devito.symbolics import count, estimate_cost, q_xop, q_leaf, uxreplace
 from devito.types import Scalar
 
 __all__ = ['cse']
 
 
-@dse_pass
-def cse(cluster, template, *args):
+@cluster_pass
+def cse(cluster, sregistry, *args):
     """
     Common sub-expressions elimination (CSE).
     """
-    make = lambda: Scalar(name=template(), dtype=cluster.dtype).indexify()
+    make = lambda: Scalar(name=sregistry.make_name(), dtype=cluster.dtype).indexify()
     processed = _cse(cluster.exprs, make)
 
     return cluster.rebuild(processed)
@@ -82,8 +82,8 @@ def _cse(maybe_exprs, make, mode='default'):
         mapper = OrderedDict([(e, make()) for i, e in enumerate(picked)])
 
         # Apply replacements
-        processed = [e.xreplace(mapper) for e in processed]
-        mapped = [e.xreplace(mapper) for e in mapped]
+        processed = [uxreplace(e, mapper) for e in processed]
+        mapped = [uxreplace(e, mapper) for e in mapped]
         mapped = [DummyEq(v, k) for k, v in reversed(list(mapper.items()))] + mapped
 
         # Update `exclude` for the same reasons as above -- to rule out CSE across
@@ -116,8 +116,13 @@ def _compact_temporaries(exprs):
     for e in exprs:
         if e.lhs not in mapper:
             # The temporary is retained, and substitutions may be applied
-            handle, _ = yreplace(e, mapper, repeat=True)
-            assert len(handle) == 1
-            processed.extend(handle)
+            expr = e
+            while True:
+                handle = uxreplace(expr, mapper)
+                if handle == expr:
+                    break
+                else:
+                    expr = handle
+            processed.append(handle)
 
     return processed

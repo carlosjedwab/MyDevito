@@ -2,16 +2,17 @@ from functools import partial
 from hashlib import sha1
 from os import environ, path
 from distutils import version
-from subprocess import DEVNULL, CalledProcessError, check_output, check_call
+from subprocess import DEVNULL, PIPE, CalledProcessError, check_output, check_call, run
 import platform
 import warnings
 import sys
+import time
 
 import numpy.ctypeslib as npct
 from codepy.jit import compile_from_string
 from codepy.toolchain import GCCToolchain
 
-from devito.archinfo import NVIDIAX, SKX, POWER8, POWER9
+from devito.archinfo import AMDGPUX, NVIDIAX, SKX, POWER8, POWER9
 from devito.exceptions import CompilationError
 from devito.logger import debug, warning, error
 from devito.parameters import configuration
@@ -30,8 +31,11 @@ def sniff_compiler_version(cc):
         https://github.com/OP2/PyOP2/
     """
     try:
-        ver = check_output([cc, "--version"]).decode("utf-8")
-    except (CalledProcessError, UnicodeDecodeError):
+        res = run([cc, "--version"], stdout=PIPE, stderr=DEVNULL)
+        ver = res.stdout.decode("utf-8")
+        if not ver:
+            return version.LooseVersion("unknown")
+    except UnicodeDecodeError:
         return version.LooseVersion("unknown")
     except FileNotFoundError:
         error("The `%s` compiler isn't available on this system" % cc)
@@ -45,6 +49,8 @@ def sniff_compiler_version(cc):
         compiler = "clang"
     elif ver.startswith("icc"):
         compiler = "icc"
+    elif ver.startswith("pgcc"):
+        compiler = "pgcc"
     else:
         compiler = "unknown"
 
@@ -52,16 +58,16 @@ def sniff_compiler_version(cc):
     if compiler in ["gcc", "icc"]:
         try:
             # gcc-7 series only spits out patch level on dumpfullversion.
-            ver = check_output([cc, "-dumpfullversion"], stderr=DEVNULL).decode("utf-8")
+            res = run([cc, "-dumpfullversion"], stdout=PIPE, stderr=DEVNULL)
+            ver = res.stdout.decode("utf-8")
             ver = '.'.join(ver.strip().split('.')[:3])
-            ver = version.StrictVersion(ver)
-        except CalledProcessError:
-            try:
-                ver = check_output([cc, "-dumpversion"], stderr=DEVNULL).decode("utf-8")
+            if not ver:
+                res = run([cc, "-dumpversion"], stdout=PIPE, stderr=DEVNULL)
+                ver = res.stdout.decode("utf-8")
                 ver = '.'.join(ver.strip().split('.')[:3])
-                ver = version.StrictVersion(ver)
-            except (CalledProcessError, UnicodeDecodeError):
-                pass
+                if not ver:
+                    return version.LooseVersion("unknown")
+            ver = version.StrictVersion(ver)
         except UnicodeDecodeError:
             pass
 
@@ -124,6 +130,10 @@ class Compiler(GCCToolchain):
         If True, JIT compile using a C++ compiler. Defaults to False.
     mpi : bool, optional
         If True, JIT compile using an MPI compiler. Defaults to False.
+    language : str, optional
+        The target language for shared-memory parallelism. Defaults to 'C'.
+    platform : Platform, optional
+        The target Platform on which the JIT compiler will be used.
     """
 
     fields = {'cc', 'ld'}
@@ -170,6 +180,15 @@ class Compiler(GCCToolchain):
         else:
             # Knowing the version may still be useful to pick supported flags
             self.version = sniff_compiler_version(self.CC)
+
+    def __new_from__(self, **kwargs):
+        """
+        Create a new Compiler from an existing one, inherenting from it
+        the flags that are not specified via ``kwargs``.
+        """
+        return self.__class__(suffix=kwargs.pop('suffix', self.suffix),
+                              mpi=kwargs.pop('mpi', configuration['mpi']),
+                              **kwargs)
 
     @memoized_meth
     def get_jit_dir(self):
@@ -271,6 +290,7 @@ class Compiler(GCCToolchain):
             try:
                 with open(src_file, 'r') as f:
                     code = f.read()
+                    code = ''.join([code, '/* Backdoor edit at %s*/ \n' % time.ctime()])
                 # Bypass the devito JIT cache
                 # Note: can't simply use Python's `mkdtemp()` as, with MPI, different
                 # ranks would end up creating different cache dirs
@@ -280,6 +300,12 @@ class Compiler(GCCToolchain):
                 raise ValueError("Trying to use the JIT backdoor for `%s`, but "
                                  "the file isn't present" % src_file)
 
+        # Should the compilation command be emitted?
+        debug = configuration['log-level'] == 'DEBUG'
+
+        # Spinlock in case of MPI
+        sleep_delay = 0 if configuration['mpi'] else 1
+
         # `catch_warnings` suppresses codepy complaining that it's taking
         # too long to acquire the cache lock. This warning can only appear
         # in a multiprocess session, typically (but not necessarily) when
@@ -287,14 +313,9 @@ class Compiler(GCCToolchain):
         # when running the test suite in parallel)
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
-
-            # Spinlock in case of MPI
-            sleep_delay = 0 if configuration['mpi'] else 1
-            _, _, _, recompiled = compile_from_string(
-                self, target, code, src_file,
-                cache_dir=cache_dir,
-                debug=configuration['debug-compiler'],
-                sleep_delay=sleep_delay)
+            _, _, _, recompiled = compile_from_string(self, target, code, src_file,
+                                                      cache_dir=cache_dir, debug=debug,
+                                                      sleep_delay=sleep_delay)
 
         return recompiled, src_file
 
@@ -333,16 +354,17 @@ class GNUCompiler(Compiler):
         super(GNUCompiler, self).__init__(*args, **kwargs)
 
         self.cflags += ['-march=native', '-Wno-unused-result', '-Wno-unused-variable',
-                        '-Wno-unused-but-set-variable', '--fast-math']
+                        '-Wno-unused-but-set-variable', '-ffast-math']
 
+        language = kwargs.pop('language', configuration['language'])
         try:
             if self.version >= version.StrictVersion("4.9.0"):
-                # Append the openmp flag regardless of configuration['openmp'],
+                # Append the openmp flag regardless of the `language` value,
                 # since GCC4.9 and later versions implement OpenMP 4.0, hence
                 # they support `#pragma omp simd`
                 self.ldflags += ['-fopenmp']
         except (TypeError, ValueError):
-            if configuration['openmp']:
+            if language == 'openmp':
                 self.ldflags += ['-fopenmp']
 
     def __lookup_cmds__(self):
@@ -359,19 +381,32 @@ class ClangCompiler(Compiler):
 
         self.cflags += ['-Wno-unused-result', '-Wno-unused-variable', '-ffast-math']
 
-        if configuration['platform'] == NVIDIAX:
-            # Clang has offloading support via OpenMP
+        language = kwargs.pop('language', configuration['language'])
+        platform = kwargs.pop('platform', configuration['platform'])
+
+        if platform is NVIDIAX:
             self.cflags.remove('-std=c99')
-            # TODO: Need a generic -march setup
-            # self.cflags += ['-Xopenmp-target', '-march=sm_37']
-            self.ldflags += ['-fopenmp', '-fopenmp-targets=nvptx64-nvidia-cuda']
+            # Add flags for OpenMP offloading
+            if language in ['C', 'openmp']:
+                # TODO: Need a generic -march setup
+                # self.cflags += ['-Xopenmp-target', '-march=sm_37']
+                self.ldflags += ['-fopenmp', '-fopenmp-targets=nvptx64-nvidia-cuda']
+        elif platform is AMDGPUX:
+            self.cflags.remove('-std=c99')
+            # Add flags for OpenMP offloading
+            if language in ['C', 'openmp']:
+                self.ldflags += ['-target', 'x86_64-pc-linux-gnu']
+                self.ldflags += ['-fopenmp',
+                                 '-fopenmp-targets=amdgcn-amd-amdhs',
+                                 '-Xopenmp-target=amdgcn-amd-amdhsa']
+                self.ldflags += ['-march=%s' % platform.march]
         else:
-            if configuration['platform'] in [POWER8, POWER9]:
+            if platform in [POWER8, POWER9]:
                 # -march isn't supported on power architectures
                 self.cflags += ['-mcpu=native']
             else:
                 self.cflags += ['-march=native']
-            if configuration['openmp']:
+            if language == 'openmp':
                 self.ldflags += ['-fopenmp']
 
     def __lookup_cmds__(self):
@@ -381,22 +416,74 @@ class ClangCompiler(Compiler):
         self.MPICXX = 'mpicxx'
 
 
+class AOMPCompiler(Compiler):
+
+    """AMD's fork of Clang for OpenMP offloading on both AMD and NVidia cards."""
+
+    def __init__(self, *args, **kwargs):
+        super(AOMPCompiler, self).__init__(*args, **kwargs)
+
+        self.cflags += ['-Wno-unused-result', '-Wno-unused-variable', '-ffast-math']
+
+        platform = kwargs.pop('platform', configuration['platform'])
+
+        if platform in [NVIDIAX, AMDGPUX]:
+            self.cflags.remove('-std=c99')
+        elif platform in [POWER8, POWER9]:
+            # It doesn't make much sense to use AOMP on Power, but it should work
+            self.cflags += ['-mcpu=native']
+        else:
+            self.cflags += ['-march=native']
+
+    def __lookup_cmds__(self):
+        self.CC = 'aompcc'
+        self.CXX = 'aompcc'
+        self.MPICC = 'mpicc'
+        self.MPICXX = 'mpicxx'
+
+
+class PGICompiler(Compiler):
+
+    def __init__(self, *args, **kwargs):
+        super(PGICompiler, self).__init__(*args, cpp=True, **kwargs)
+
+        self.cflags.remove('-std=c99')
+        self.cflags.remove('-O3')
+        self.cflags.remove('-Wall')
+        self.cflags += ['-fast', '-acc']
+        # Default PGI compile for a target is GPU and single threaded host.
+        # self.cflags += ['-ta=tesla,host']
+
+    def __lookup_cmds__(self):
+        # NOTE: using `pgc++` instead of `pgcc` because of issue #1219
+        self.CC = 'pgc++'
+        self.CXX = 'pgc++'
+        self.MPICC = 'mpic++'
+        self.MPICXX = 'mpicxx'
+
+
 class IntelCompiler(Compiler):
 
     def __init__(self, *args, **kwargs):
         super(IntelCompiler, self).__init__(*args, **kwargs)
+
         self.cflags += ["-xhost"]
-        if configuration['platform'] is SKX:
+
+        language = kwargs.pop('language', configuration['language'])
+        platform = kwargs.pop('platform', configuration['platform'])
+
+        if platform is SKX:
             # Systematically use 512-bit vectors on skylake
             self.cflags += ["-qopt-zmm-usage=high"]
+
         try:
             if self.version >= version.StrictVersion("15.0.0"):
-                # Append the OpenMP flag regardless of configuration['openmp'],
+                # Append the OpenMP flag regardless of configuration['language'],
                 # since icc15 and later versions implement OpenMP 4.0, hence
                 # they support `#pragma omp simd`
                 self.ldflags += ['-qopenmp']
         except (TypeError, ValueError):
-            if configuration['openmp']:
+            if language == 'openmp':
                 # Note: fopenmp, not qopenmp, is what is needed by icc versions < 15.0
                 self.ldflags += ['-fopenmp']
 
@@ -430,28 +517,48 @@ class IntelKNLCompiler(IntelCompiler):
 
     def __init__(self, *args, **kwargs):
         super(IntelKNLCompiler, self).__init__(*args, **kwargs)
+
         self.cflags += ["-xMIC-AVX512"]
-        if not configuration['openmp']:
+
+        language = kwargs.pop('language', configuration['language'])
+
+        if language != 'openmp':
             warning("Running on Intel KNL without OpenMP is highly discouraged")
 
 
 class CustomCompiler(Compiler):
+
     """
     Custom compiler based on standard environment flags.
+
+    If no environment flags are found, defaults to the GNUCompiler.
 
     Notes
     -----
     Currently honours CC, CFLAGS and LDFLAGS, with defaults similar to the
-    default GNU/gcc settings. If DEVITO_ARCH is enabled, the OpenMP linker
-    flags are read from OMP_LDFLAGS or otherwise default to ``-fopenmp``.
+    default GNU/gcc settings. If DEVITO_ARCH is enabled and the DEVITO_LANGUAGE
+    is set to 'openmp', then the OpenMP linker flags are read from OMP_LDFLAGS
+    or otherwise default to ``-fopenmp``.
     """
+
+    def __new__(cls, *args, **kwargs):
+        if any(i in environ for i in ['CC', 'CXX', 'CFLAGS', 'LDFLAGS']):
+            obj = super().__new__(cls, *args, **kwargs)
+            obj.__init__(*args, **kwargs)
+            return obj
+        else:
+            return GNUCompiler(*args, **kwargs)
 
     def __init__(self, *args, **kwargs):
         super(CustomCompiler, self).__init__(*args, **kwargs)
+
         default = '-O3 -g -march=native -fPIC -Wall -std=c99'
         self.cflags = environ.get('CFLAGS', default).split(' ')
         self.ldflags = environ.get('LDFLAGS', '-shared').split(' ')
-        if configuration['openmp']:
+
+        language = kwargs.pop('language', configuration['language'])
+
+        if language == 'openmp':
             self.ldflags += environ.get('OMP_LDFLAGS', '-fopenmp').split(' ')
 
     def __lookup_cmds__(self):
@@ -466,6 +573,9 @@ compiler_registry = {
     'gnu': GNUCompiler,
     'gcc': GNUCompiler,
     'clang': ClangCompiler,
+    'aomp': AOMPCompiler,
+    'pgcc': PGICompiler,
+    'pgi': PGICompiler,
     'osx': ClangCompiler,
     'intel': IntelCompiler,
     'icpc': IntelCompiler,

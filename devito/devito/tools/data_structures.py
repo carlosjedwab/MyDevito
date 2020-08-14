@@ -9,10 +9,11 @@ from devito.tools.utils import as_tuple, filter_ordered
 from devito.tools.algorithms import toposort
 
 __all__ = ['Bunch', 'EnrichedTuple', 'ReducerMap', 'DefaultOrderedDict',
-           'OrderedSet', 'PartialOrderTuple', 'DAG']
+           'OrderedSet', 'PartialOrderTuple', 'DAG', 'frozendict']
 
 
 class Bunch(object):
+
     """
     Bind together an arbitrary number of generic items. This is a mutable
     alternative to a ``namedtuple``.
@@ -22,12 +23,17 @@ class Bunch(object):
         http://code.activestate.com/recipes/52308-the-simple-but-handy-collector-of\
         -a-bunch-of-named/?in=user-97991
     """
+
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
 
 
 class EnrichedTuple(tuple):
-    """A tuple with an arbitrary number of additional attributes."""
+
+    """
+    A tuple with an arbitrary number of additional attributes.
+    """
+
     def __new__(cls, *items, getters=None, **kwargs):
         obj = super(EnrichedTuple, cls).__new__(cls, items)
         obj.__dict__.update(kwargs)
@@ -38,10 +44,14 @@ class EnrichedTuple(tuple):
         if isinstance(key, (int, slice)):
             return super(EnrichedTuple, self).__getitem__(key)
         else:
-            return self._getters[key]
+            return self.__getitem_hook__(key)
+
+    def __getitem_hook__(self, key):
+        return self._getters[key]
 
 
 class ReducerMap(MultiDict):
+
     """
     Specialised MultiDict object that maps a single key to a
     list of potential values and provides a reduction method for
@@ -418,3 +428,47 @@ class DAG(object):
             return l
         else:
             raise ValueError('graph is not acyclic')
+
+
+class frozendict(Mapping):
+    """
+    An immutable wrapper around dictionaries that implements the complete
+    :py:class:`collections.Mapping` interface. It can be used as a drop-in
+    replacement for dictionaries where immutability is desired.
+
+    Extracted from the now decrepit project:
+
+        https://github.com/slezica/python-frozendict
+    """
+
+    dict_cls = dict
+
+    def __init__(self, *args, **kwargs):
+        self._dict = self.dict_cls(*args, **kwargs)
+        self._hash = None
+
+    def __getitem__(self, key):
+        return self._dict[key]
+
+    def __contains__(self, key):
+        return key in self._dict
+
+    def copy(self, **add_or_replace):
+        return self.__class__(self, **add_or_replace)
+
+    def __iter__(self):
+        return iter(self._dict)
+
+    def __len__(self):
+        return len(self._dict)
+
+    def __repr__(self):
+        return '<%s %r>' % (self.__class__.__name__, self._dict)
+
+    def __hash__(self):
+        if self._hash is None:
+            h = 0
+            for key, value in self._dict.items():
+                h ^= hash((key, value))
+            self._hash = h
+        return self._hash

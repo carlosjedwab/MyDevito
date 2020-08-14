@@ -12,10 +12,10 @@ from devito.ir.equations import DummyEq
 from devito.ir.iet import (Call, Callable, Conditional, Expression, ExpressionBundle,
                            AugmentedExpression, Iteration, List, Prodder, Return,
                            make_efunc, FindNodes, Transformer)
-from devito.ir.support import PARALLEL
+from devito.ir.support import AFFINE, PARALLEL
 from devito.mpi import MPI
 from devito.symbolics import (Byref, CondNe, FieldFromPointer, FieldFromComposite,
-                              IndexedPointer, Macro)
+                              IndexedPointer, Macro, subs_op_args)
 from devito.tools import OrderedSet, dtype_to_mpitype, dtype_to_ctype, flatten, generator
 from devito.types import Array, Dimension, Symbol, LocalObject, CompositeObject
 
@@ -323,20 +323,18 @@ class BasicHaloExchangeBuilder(HaloExchangeBuilder):
         iet = Expression(eq)
         for i, d in reversed(list(zip(buf_indices, buf_dims))):
             # The -1 below is because an Iteration, by default, generates <=
-            iet = Iteration(iet, i, d.symbolic_size - 1, properties=PARALLEL)
+            iet = Iteration(iet, i, d.symbolic_size - 1, properties=(PARALLEL, AFFINE))
 
         parameters = [buf] + list(buf.shape) + [f] + f_offsets
-        return Callable(name, iet, 'void', parameters, ('static',))
+        return CopyBuffer(name, iet, parameters)
 
     def _make_sendrecv(self, f, hse, key, **kwargs):
         comm = f.grid.distributor._obj_comm
 
         buf_dims = [Dimension(name='buf_%s' % d.root) for d in f.dimensions
                     if d not in hse.loc_indices]
-        bufg = Array(name='bufg', dimensions=buf_dims, dtype=f.dtype,
-                     padding=0, scope='heap')
-        bufs = Array(name='bufs', dimensions=buf_dims, dtype=f.dtype,
-                     padding=0, scope='heap')
+        bufg = Array(name='bufg', dimensions=buf_dims, dtype=f.dtype, padding=0)
+        bufs = Array(name='bufs', dimensions=buf_dims, dtype=f.dtype, padding=0)
 
         ofsg = [Symbol(name='og%s' % d.root) for d in f.dimensions]
         ofss = [Symbol(name='os%s' % d.root) for d in f.dimensions]
@@ -366,7 +364,7 @@ class BasicHaloExchangeBuilder(HaloExchangeBuilder):
 
         iet = List(body=[recv, gather, send, waitsend, waitrecv, scatter])
         parameters = ([f] + list(bufs.shape) + ofsg + ofss + [fromrank, torank, comm])
-        return Callable('sendrecv_%s' % key, iet, 'void', parameters, ('static',))
+        return SendRecv(key, iet, parameters, bufg, bufs)
 
     def _call_sendrecv(self, name, *args, **kwargs):
         return Call(name, flatten(args))
@@ -423,7 +421,7 @@ class BasicHaloExchangeBuilder(HaloExchangeBuilder):
 
         iet = List(body=body)
         parameters = [f, comm, nb] + list(fixed.values())
-        return Callable('haloupdate%d' % key, iet, 'void', parameters, ('static',))
+        return HaloUpdate(key, iet, parameters)
 
     def _call_haloupdate(self, name, f, hse, *args):
         comm = f.grid.distributor._obj_comm
@@ -497,7 +495,7 @@ class DiagHaloExchangeBuilder(BasicHaloExchangeBuilder):
 
         iet = List(body=body)
         parameters = [f, comm, nb] + list(fixed.values())
-        return Callable('haloupdate%d' % key, iet, 'void', parameters, ('static',))
+        return HaloUpdate(key, iet, parameters)
 
 
 class OverlapHaloExchangeBuilder(DiagHaloExchangeBuilder):
@@ -564,7 +562,7 @@ class OverlapHaloExchangeBuilder(DiagHaloExchangeBuilder):
 
         iet = List(body=[recv, gather, send])
         parameters = ([f] + ofsg + [fromrank, torank, comm, msg])
-        return Callable('sendrecv_%s' % key, iet, 'void', parameters, ('static',))
+        return SendRecv(key, iet, parameters, bufg, bufs)
 
     def _call_sendrecv(self, name, *args, msg=None, haloid=None):
         # Drop `sizes` as this HaloExchangeBuilder conveys them through `msg`
@@ -669,7 +667,7 @@ class Overlap2HaloExchangeBuilder(OverlapHaloExchangeBuilder):
     """
 
     def _make_region(self, hs, key):
-        return MPIRegion('reg%d' % key, hs.arguments, hs.omapper.owned)
+        return MPIRegion('reg', key, hs.arguments, hs.omapper.owned)
 
     def _make_msg(self, f, hse, key):
         # Only retain the halos required by the Diag scheme
@@ -737,7 +735,7 @@ class Overlap2HaloExchangeBuilder(OverlapHaloExchangeBuilder):
         ncomms = Symbol(name='ncomms')
         iet = Iteration([recv, gather, send], dim, ncomms - 1)
         parameters = ([f, comm, msg, ncomms]) + list(fixed.values())
-        return Callable('haloupdate%d' % key, iet, 'void', parameters, ('static',))
+        return HaloUpdate(key, iet, parameters)
 
     def _call_haloupdate(self, name, f, hse, msg):
         comm = f.grid.distributor._obj_comm
@@ -860,6 +858,36 @@ class FullHaloExchangeBuilder(Overlap2HaloExchangeBuilder):
         return Prodder(poke.name, poke.parameters, single_thread=True, periodic=True)
 
 
+# Callable sub-hierarchy
+
+
+class MPICallable(Callable):
+
+    def __init__(self, name, body, parameters):
+        super(MPICallable, self).__init__(name, body, 'void', parameters, ('static',))
+
+
+class CopyBuffer(MPICallable):
+    pass
+
+
+class SendRecv(MPICallable):
+
+    def __init__(self, key, body, parameters, bufg, bufs):
+        super(SendRecv, self).__init__('sendrecv_%s' % key, body, parameters)
+        self.bufg = bufg
+        self.bufs = bufs
+
+
+class HaloUpdate(MPICallable):
+
+    def __init__(self, key, body, parameters):
+        super(HaloUpdate, self).__init__('haloupdate_%s' % key, body, parameters)
+
+
+# Types sub-hierarchy
+
+
 class MPIStatusObject(LocalObject):
 
     dtype = type('MPI_Status', (c_void_p,), {})
@@ -895,17 +923,19 @@ class MPIMsg(CompositeObject):
     else:
         c_mpirequest_p = type('MPI_Request', (c_void_p,), {})
 
-    def __init__(self, name, function, halos, fields=None):
+    fields = [
+        (_C_field_bufs, c_void_p),
+        (_C_field_bufg, c_void_p),
+        (_C_field_sizes, POINTER(c_int)),
+        (_C_field_rrecv, c_mpirequest_p),
+        (_C_field_rsend, c_mpirequest_p),
+    ]
+
+    def __init__(self, name, function, halos):
         self._function = function
         self._halos = halos
-        fields = (fields or []) + [
-            (MPIMsg._C_field_bufs, c_void_p),
-            (MPIMsg._C_field_bufg, c_void_p),
-            (MPIMsg._C_field_sizes, POINTER(c_int)),
-            (MPIMsg._C_field_rrecv, MPIMsg.c_mpirequest_p),
-            (MPIMsg._C_field_rsend, MPIMsg.c_mpirequest_p),
-        ]
-        super(MPIMsg, self).__init__(name, 'msg', fields)
+
+        super(MPIMsg, self).__init__(name, 'msg', self.fields)
 
         # Required for buffer allocation/deallocation before/after jumping/returning
         # to/from C-land
@@ -979,14 +1009,12 @@ class MPIMsgEnriched(MPIMsg):
     _C_field_from = 'fromrank'
     _C_field_to = 'torank'
 
-    def __init__(self, name, function, halos):
-        fields = [
-            (MPIMsgEnriched._C_field_ofss, POINTER(c_int)),
-            (MPIMsgEnriched._C_field_ofsg, POINTER(c_int)),
-            (MPIMsgEnriched._C_field_from, c_int),
-            (MPIMsgEnriched._C_field_to, c_int)
-        ]
-        super(MPIMsgEnriched, self).__init__(name, function, halos, fields)
+    fields = MPIMsg.fields + [
+        (_C_field_ofss, POINTER(c_int)),
+        (_C_field_ofsg, POINTER(c_int)),
+        (_C_field_from, c_int),
+        (_C_field_to, c_int)
+    ]
 
     def _arg_defaults(self, alias=None):
         super(MPIMsgEnriched, self)._arg_defaults(alias)
@@ -1024,11 +1052,16 @@ class MPIMsgEnriched(MPIMsg):
 
 class MPIRegion(CompositeObject):
 
-    def __init__(self, name, arguments, owned):
+    def __init__(self, prefix, key, arguments, owned):
+        self._prefix = prefix
+        self._key = key
         self._owned = owned
 
         # Sorting for deterministic codegen
         self._arguments = sorted(arguments, key=lambda i: i.name)
+
+        name = "%s%d" % (prefix, key)
+        pname = "region%d" % key
 
         fields = []
         for i in self.arguments:
@@ -1037,7 +1070,8 @@ class MPIRegion(CompositeObject):
                 fields.append((i.max_name, c_int))
             else:
                 fields.append((i.name, c_int))
-        super(MPIRegion, self).__init__(name, 'region', fields)
+
+        super(MPIRegion, self).__init__(name, pname, fields)
 
     def __value_setup__(self, dtype, value):
         # We eventually produce an array of `struct region` that is as big as
@@ -1048,6 +1082,14 @@ class MPIRegion(CompositeObject):
     @property
     def arguments(self):
         return self._arguments
+
+    @property
+    def prefix(self):
+        return self._prefix
+
+    @property
+    def key(self):
+        return self._key
 
     @property
     def owned(self):
@@ -1064,14 +1106,14 @@ class MPIRegion(CompositeObject):
             for a in self.arguments:
                 if a.is_Dimension:
                     a_m, a_M = mapper[a]
-                    setattr(entry, a.min_name, mapper[a][0].subs(args))
-                    setattr(entry, a.max_name, mapper[a][1].subs(args))
+                    setattr(entry, a.min_name, subs_op_args(a_m, args))
+                    setattr(entry, a.max_name, subs_op_args(a_M, args))
                 else:
                     try:
-                        setattr(entry, a.name, mapper[a][0].subs(args))
+                        setattr(entry, a.name, subs_op_args(mapper[a][0], args))
                     except AttributeError:
                         setattr(entry, a.name, mapper[a][0])
         return values
 
     # Pickling support
-    _pickle_args = ['name', 'arguments', 'owned']
+    _pickle_args = ['prefix', 'key', 'arguments', 'owned']

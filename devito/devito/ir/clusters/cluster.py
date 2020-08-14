@@ -2,13 +2,12 @@ from itertools import chain
 
 import numpy as np
 from cached_property import cached_property
-from frozendict import frozendict
 
 from devito.ir.equations import ClusterizedEq
 from devito.ir.support import (IterationSpace, DataSpace, Scope, detect_io,
                                normalize_properties)
 from devito.symbolics import estimate_cost
-from devito.tools import as_tuple, flatten
+from devito.tools import as_tuple, flatten, frozendict
 
 __all__ = ["Cluster", "ClusterGroup"]
 
@@ -108,6 +107,14 @@ class Cluster(object):
         return self.ispace.itintervals
 
     @property
+    def sub_iterators(self):
+        return self.ispace.sub_iterators
+
+    @property
+    def directions(self):
+        return self.ispace.directions
+
+    @property
     def dspace(self):
         return self._dspace
 
@@ -188,8 +195,8 @@ class Cluster(object):
 
     @cached_property
     def ops(self):
-        """The Cluster operation count."""
-        return self.ispace.size*sum(estimate_cost(i) for i in self.exprs)
+        """Number of operations performed at each iteration."""
+        return sum(estimate_cost(i) for i in self.exprs)
 
     @cached_property
     def traffic(self):

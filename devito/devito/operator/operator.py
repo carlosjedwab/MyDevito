@@ -6,21 +6,26 @@ from math import ceil
 from cached_property import cached_property
 import ctypes
 
+from devito.archinfo import platform_registry
+from devito.compiler import compiler_registry
 from devito.exceptions import InvalidOperator
+from devito.finite_differences import Evaluable
 from devito.logger import info, perf, warning, is_log_enabled_for
 from devito.ir.equations import LoweredEq
 from devito.ir.clusters import ClusterGroup, clusterize
-from devito.ir.iet import Callable, MetaCall, iet_build, derive_parameters
+from devito.ir.iet import Callable, MetaCall, derive_parameters, iet_build, iet_lower_dims
 from devito.ir.stree import stree_build
-from devito.operator.registry import operator_selector
+from devito.ir.equations.algorithms import lower_exprs
 from devito.operator.profiling import create_profile
+from devito.operator.registry import operator_selector
+from devito.operator.symbols import SymbolRegistry
 from devito.mpi import MPI
 from devito.parameters import configuration
-from devito.passes import Graph
-from devito.symbolics import indexify
+from devito.passes import Graph, NThreads, NThreadsNested, NThreadsNonaffine
+from devito.symbolics import estimate_cost, retrieve_functions
 from devito.tools import (DAG, Signer, ReducerMap, as_tuple, flatten, filter_ordered,
-                          filter_sorted, split, timed_pass, timed_region, Evaluable)
-from devito.types import Dimension, Eq
+                          filter_sorted, split, timed_pass, timed_region)
+from devito.types import CustomDimension, Dimension, Eq
 
 __all__ = ['Operator']
 
@@ -40,12 +45,17 @@ class Operator(Callable):
             Name of the Operator, defaults to "Kernel".
         * subs : dict
             Symbolic substitutions to be applied to ``expressions``.
-        * dse : str
-            Aggressiveness of the Devito Symbolic Engine for flop
-            optimization. Defaults to ``configuration['dse']``.
-        * dle : str
-            Aggressiveness of the Devito Loop Engine for loop-level
-            optimization. Defaults to ``configuration['dle']``.
+        * opt : str
+            The performance optimization level. Defaults to ``configuration['opt']``.
+        * language : str
+            The target language for shared-memory parallelism. Defaults to
+            ``configuration['language']``.
+        * platform : str
+            The architecture the code is generated for. Defaults to
+            ``configuration['platform']``.
+        * compiler : str
+            The backend compiler used to jit-compile the generated code.
+            Defaults to ``configuration['compiler']``.
 
     Examples
     --------
@@ -139,6 +149,12 @@ class Operator(Callable):
         # The Operator type for the given target
         cls = operator_selector(**kwargs)
 
+        # Normalize input arguments for the selected Operator
+        kwargs = cls._normalize_kwargs(**kwargs)
+
+        # Create a symbol registry
+        kwargs['sregistry'] = cls._symbol_registry()
+
         # Lower to a JIT-compilable object
         with timed_region('op-compile') as r:
             op = cls._build(expressions, **kwargs)
@@ -148,6 +164,20 @@ class Operator(Callable):
         op._emit_build_profiling()
 
         return op
+
+    @classmethod
+    def _normalize_kwargs(cls, **kwargs):
+        return kwargs
+
+    @classmethod
+    def _symbol_registry(cls):
+        # Special symbols an Operator might use
+        nthreads = NThreads(aliases='nthreads0')
+        nthreads_nested = NThreadsNested(aliases='nthreads1')
+        nthreads_nonaffine = NThreadsNonaffine(aliases='nthreads2')
+        threadid = CustomDimension(name='tid', symbolic_size=nthreads)
+
+        return SymbolRegistry(nthreads, nthreads_nested, nthreads_nonaffine, threadid)
 
     @classmethod
     def _build(cls, expressions, **kwargs):
@@ -185,7 +215,7 @@ class Operator(Callable):
         op._includes.extend(byproduct.includes)
 
         # Required for the jit-compilation
-        op._compiler = configuration['compiler']
+        op._compiler = kwargs['compiler']
         op._lib = None
         op._cfunction = None
 
@@ -234,8 +264,9 @@ class Operator(Callable):
                     dims = [d for d in dims if d not in frozenset(sub_dims)]
                     dims.append(e.subdomain.implicit_dimension)
                     if e.subdomain not in seen:
+                        grid = list(retrieve_functions(e, mode='unique'))[0].grid
                         processed.extend([i.func(*i.args, implicit_dims=dims) for i in
-                                          e.subdomain._create_implicit_exprs()])
+                                          e.subdomain._create_implicit_exprs(grid)])
                         seen.add(e.subdomain)
                     dims.extend(e.subdomain.dimensions)
                     new_e = Eq(e.lhs, e.rhs, subdomain=e.subdomain, implicit_dims=dims)
@@ -248,24 +279,7 @@ class Operator(Callable):
 
     @classmethod
     def _initialize_state(cls, **kwargs):
-        return {'optimizations': {k: kwargs.get(k, configuration[k])
-                                  for k in ('dse', 'dle')}}
-
-    @classmethod
-    def _apply_substitutions(cls, expressions, subs):
-        """
-        Transform ``expressions`` by: ::
-
-            * Applying any user-provided symbolic substitution;
-            * Replacing Dimensions with SubDimensions based on expression SubDomains.
-        """
-        processed = []
-        for e in expressions:
-            mapper = subs.copy()
-            if e.subdomain:
-                mapper.update(e.subdomain.dimension_map)
-            processed.append(e.xreplace(mapper))
-        return processed
+        return {'optimizations': kwargs.get('mode', configuration['opt'])}
 
     @classmethod
     def _specialize_exprs(cls, expressions):
@@ -287,17 +301,20 @@ class Operator(Callable):
             * Apply substitution rules;
             * Specialize (e.g., index shifting)
         """
-        subs = kwargs.get("subs", {})
-
+        # Add in implicit expressions, e.g., induced by SubDomains
         expressions = cls._add_implicit(expressions)
+
+        # Unfold lazyiness
         expressions = flatten([i.evaluate for i in expressions])
+
+        # Scalarize tensor expressions
         expressions = [j for i in expressions for j in i._flatten]
-        expressions = [indexify(i) for i in expressions]
-        expressions = cls._apply_substitutions(expressions, subs)
 
-        expressions = cls._specialize_exprs(expressions)
+        expressions = lower_exprs(expressions, **kwargs)
 
-        return expressions
+        processed = cls._specialize_exprs(expressions)
+
+        return processed
 
     # Compilation -- Cluster level
 
@@ -309,17 +326,27 @@ class Operator(Callable):
         return clusters
 
     @classmethod
+    @timed_pass(name='lowering.Clusters')
     def _lower_clusters(cls, expressions, profiler, **kwargs):
         """
         Clusters lowering:
 
             * Group expressions into Clusters;
-            * Introduce guards for conditional Clusters.
+            * Introduce guards for conditional Clusters;
+            * Analyze Clusters to detect computational properties such
+              as parallelism.
         """
         # Build a sequence of Clusters from a sequence of Eqs
         clusters = clusterize(expressions)
 
-        clusters = cls._specialize_clusters(clusters, profiler=profiler, **kwargs)
+        # Operation count before specialization
+        init_ops = sum(estimate_cost(c.exprs) for c in clusters if c.is_dense)
+
+        clusters = cls._specialize_clusters(clusters, **kwargs)
+
+        # Operation count after specialization
+        final_ops = sum(estimate_cost(c.exprs) for c in clusters if c.is_dense)
+        profiler.record_ops_variation(init_ops, final_ops)
 
         return ClusterGroup(clusters)
 
@@ -359,12 +386,12 @@ class Operator(Callable):
         return graph
 
     @classmethod
+    @timed_pass(name='lowering.IET')
     def _lower_iet(cls, stree, profiler, **kwargs):
         """
         Iteration/Expression tree lowering:
 
             * Turn a ScheduleTree into an Iteration/Expression tree;
-            * Perform analysis to detect optimization opportunities;
             * Introduce distributed-memory, shared-memory, and SIMD parallelism;
             * Introduce optimizations for data locality;
             * Finalize (e.g., symbol definitions, array casts)
@@ -376,6 +403,9 @@ class Operator(Callable):
 
         # Instrument the IET for C-level profiling
         iet = profiler.instrument(iet)
+
+        # Lower all DerivedDimensions
+        iet = iet_lower_dims(iet)
 
         # Wrap the IET with a Callable
         parameters = derive_parameters(iet, True)
@@ -570,7 +600,7 @@ class Operator(Callable):
     # Execution
 
     def __call__(self, **kwargs):
-        self.apply(**kwargs)
+        return self.apply(**kwargs)
 
     def apply(self, **kwargs):
         """
@@ -752,10 +782,7 @@ class Operator(Callable):
                 perf("%s* %s%s computed in %.2f s"
                      % (indent, name, rank, fround(v.time)))
 
-        # Emit relevant configuration values
-        perf("Configuration:  %s" % self._state['optimizations'])
-
-        # Emit relevant performance arguments
+        # Emit performance mode and arguments
         perf_args = {}
         for i in self.input + self.dimensions:
             if not i.is_PerfKnob:
@@ -768,7 +795,8 @@ class Operator(Callable):
                     if a in args:
                         perf_args[a] = args[a]
                         break
-        perf("Performance arguments:  %s" % perf_args)
+        perf("Performance[mode=%s] arguments: %s" % (self._state['optimizations'],
+                                                     perf_args))
 
         return summary
 
@@ -871,58 +899,104 @@ class ArgumentsMap(dict):
 
 def parse_kwargs(**kwargs):
     """
-    Parse keyword arguments provided to an Operator. This routine is
-    especially useful for backwards compatibility.
+    Parse keyword arguments provided to an Operator.
     """
-    # `dle`
-    dle = kwargs.pop("dle", configuration['dle'])
+    # `dse` -- deprecated, dropped
+    dse = kwargs.pop("dse", None)
+    if dse is not None:
+        warning("The `dse` argument is deprecated. "
+                "The optimization level is now controlled via the `opt` argument")
 
-    if not dle or isinstance(dle, str):
-        mode, options = dle, {}
-    elif isinstance(dle, tuple):
-        if len(dle) == 0:
-            mode, options = 'noop', {}
-        elif isinstance(dle[-1], dict):
-            if len(dle) == 2:
-                mode, options = dle
-            else:
-                mode, options = tuple(flatten(i.split(',') for i in dle[:-1])), dle[-1]
+    # `dle` -- deprecated, replaced by `opt`
+    if 'dle' in kwargs:
+        warning("The `dle` argument is deprecated. "
+                "The optimization level is now controlled via the `opt` argument")
+        dle = kwargs.pop('dle')
+        if 'opt' in kwargs:
+            warning("Both `dle` and `opt` were passed; ignoring `dle` argument")
+            opt = kwargs.pop('opt')
         else:
-            mode, options = tuple(flatten(i.split(',') for i in dle)), {}
+            warning("Setting `opt=%s`" % str(dle))
+            opt = dle
+    elif 'opt' in kwargs:
+        opt = kwargs.pop('opt')
     else:
-        raise InvalidOperator("Illegal `dle=%s`" % str(dle))
+        opt = configuration['opt']
 
-    # `dle`, options
-    options.setdefault('blockinner',
-                       configuration['dle-options'].get('blockinner', False))
-    options.setdefault('blocklevels',
-                       configuration['dle-options'].get('blocklevels', None))
-    options.setdefault('openmp', configuration['openmp'])
+    if not opt or isinstance(opt, str):
+        mode, options = opt, {}
+    elif isinstance(opt, tuple):
+        if len(opt) == 0:
+            mode, options = 'noop', {}
+        elif isinstance(opt[-1], dict):
+            if len(opt) == 2:
+                mode, options = opt
+            else:
+                mode, options = tuple(flatten(i.split(',') for i in opt[:-1])), opt[-1]
+        else:
+            mode, options = tuple(flatten(i.split(',') for i in opt)), {}
+    else:
+        raise InvalidOperator("Illegal `opt=%s`" % str(opt))
+
+    # `opt`, deprecated kwargs
+    kwopenmp = kwargs.get('openmp', options.get('openmp'))
+    if kwopenmp is None:
+        openmp = kwargs.get('language', configuration['language']) == 'openmp'
+    else:
+        openmp = kwopenmp
+
+    # `opt`, options
+    options = dict(options)
+    options.setdefault('openmp', openmp)
     options.setdefault('mpi', configuration['mpi'])
+    for k, v in configuration['opt-options'].items():
+        options.setdefault(k, v)
     kwargs['options'] = options
 
-    # `dle`, mode
+    # `opt`, mode
     if mode is None:
         mode = 'noop'
-    elif mode == 'noop':
-        mode = tuple(i for i in ['mpi', 'openmp'] if options[i]) or 'noop'
     kwargs['mode'] = mode
 
-    # `dse`
-    dse = kwargs.pop("dse", configuration['dse'])
-
-    if not dse:
-        kwargs['dse'] = 'noop'
-    elif isinstance(dse, str):
-        kwargs['dse'] = dse
+    # `platform`
+    platform = kwargs.get('platform')
+    if platform is not None:
+        if not isinstance(platform, str):
+            raise ValueError("Argument `platform` should be a `str`")
+        if platform not in configuration._accepted['platform']:
+            raise InvalidOperator("Illegal `platform=%s`" % str(platform))
+        kwargs['platform'] = platform_registry[platform]()
     else:
-        try:
-            kwargs['dse'] = ','.join(dse)
-        except:
-            raise InvalidOperator("Illegal `dse=%s`" % str(dse))
+        kwargs['platform'] = configuration['platform']
 
-    # Attach `platform` too for convenience, so we don't need `configuration` in
-    # most compilation passes
-    kwargs['platform'] = configuration['platform']
+    # `language`
+    language = kwargs.get('language')
+    if language is not None:
+        if not isinstance(language, str):
+            raise ValueError("Argument `language` should be a `str`")
+        if language not in configuration._accepted['language']:
+            raise InvalidOperator("Illegal `language=%s`" % str(language))
+        kwargs['language'] = language
+    elif kwopenmp is not None:
+        # Handle deprecated `openmp` kwarg for backward compatibility
+        kwargs['language'] = 'openmp' if openmp else 'C'
+    else:
+        kwargs['language'] = configuration['language']
+
+    # `compiler`
+    compiler = kwargs.get('compiler')
+    if compiler is not None:
+        if not isinstance(compiler, str):
+            raise ValueError("Argument `compiler` should be a `str`")
+        if compiler not in configuration._accepted['compiler']:
+            raise InvalidOperator("Illegal `compiler=%s`" % str(compiler))
+        kwargs['compiler'] = compiler_registry[compiler](platform=kwargs['platform'],
+                                                         language=kwargs['language'])
+    elif any([platform, language]):
+        kwargs['compiler'] =\
+            configuration['compiler'].__new_from__(platform=kwargs['platform'],
+                                                   language=kwargs['language'])
+    else:
+        kwargs['compiler'] = configuration['compiler']
 
     return kwargs
