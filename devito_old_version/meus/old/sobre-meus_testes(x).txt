@@ -1,0 +1,5 @@
+meu_teste(1).py -- modelo direto só com resultado dos receptores
+meu_teste(2).py -- modelo direto com video da onda
+meu_teste(3).py -- FWI com modelo de duas velocidades
+meu_teste(4).py -- FWI com modelo de circulo no centro (obs: desconvergencia com 10 fwi_iterations
+meu_teste(5).py -- FWI com modelo de circulo no centro simplificado e classificado
