@@ -15,19 +15,16 @@ or
 sudo docker rm $(sudo docker ps -a -q)
 sudo docker images | sudo grep none | sudo awk '{ print $3; }' | sudo xargs docker rmi
 ```
-<br/>
 
 To *run* the jupyter notebook server:
 ```ruby
 sudo docker-compose up devito
 ```
-<br/>
 
 To *open* the container:
 ```ruby
 sudo docker-compose run devito /bin/bash
 ```
-<br/>
 
 ## Observation
 
