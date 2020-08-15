@@ -28,6 +28,7 @@ To *open* the container:
 sudo docker-compose run devito /bin/bash
 ```
 <br/>
+
 ## Observation
 
 ### Changes in the container don't imply changes in the local files, so don't forget to download your changes to make sure you don't lose them.
